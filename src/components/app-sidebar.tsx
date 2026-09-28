@@ -12,7 +12,7 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar'
-import { ImageDown, SettingsIcon, TerminalIcon, Folder, Video } from 'lucide-react'
+import { ImageDown, SettingsIcon, TerminalIcon, Folder, Video, Database } from 'lucide-react'
 import { Separator } from '@/components/ui/separator'
 import { useValue, useSetPartialValuesCallback } from '@/schema/tinybase-schema'
 import packageJson from '../../package.json'
@@ -26,9 +26,17 @@ export function AppSidebar() {
   const logsOpen = useValue('logsOpen')
   const logsUnread = useValue('logsUnread')
 
+  // The logs and database panels are mutually exclusive.
   const toggleLogsOpen = useSetPartialValuesCallback((_, store) => ({
     logsOpen: !store.getValue('logsOpen'),
     logsUnread: false,
+    dbViewerOpen: false,
+  }))
+
+  const dbViewerOpen = useValue('dbViewerOpen')
+  const toggleDbViewer = useSetPartialValuesCallback((_, store) => ({
+    dbViewerOpen: !store.getValue('dbViewerOpen'),
+    logsOpen: false,
   }))
 
   const isHomeActive = location.pathname === '/'
@@ -142,6 +150,17 @@ export function AppSidebar() {
               )}
               <TerminalIcon className="h-4 w-4 shrink-0" />
               <span>logs</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              size="sm"
+              onClick={toggleDbViewer}
+              isActive={dbViewerOpen}
+              tooltip={isCollapsed ? 'Toggle database viewer' : undefined}
+            >
+              <Database className="h-4 w-4 shrink-0" />
+              <span>database</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>

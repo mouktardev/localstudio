@@ -1,6 +1,6 @@
 [package]
 name = "localstudio"
-version = "0.2.3"
+version = "0.3.0"
 description = "an open source desktop application for for image optimization with ai tools focus on privacy for local devices"
 authors = ["Mouktar"]
 edition = "2021"
@@ -46,4 +46,5 @@ futures-util = "0.3"
 
 ffmpeg-sidecar = { version = "2.5", features = ["download_ffmpeg"] }
 tempfile = "3"
+tokio = { version = "1", features = ["sync"] }
 

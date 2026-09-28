@@ -1,4 +1,4 @@
-import { createFileRoute, useRouter } from '@tanstack/react-router'
+import { createFileRoute } from '@tanstack/react-router'
 import { useState, useEffect } from 'react'
 import { useValue, useCell, useSetValueCallback, useSetRowCallback } from '@/schema/tinybase-schema'
 import {
@@ -9,7 +9,6 @@ import {
   revealInExplorer,
   selectFolder,
   getDbPath,
-  syncDatabase,
   getUpscaleSettings,
   setUpscaleSettings as saveUpscaleSettings,
   getModelStatus,
@@ -18,6 +17,11 @@ import {
   downloadBgRemovalModel,
   checkFfmpegStatus,
   downloadFfmpeg,
+  getVideoJobLimit,
+  setVideoJobLimit,
+  getImageJobLimit,
+  setImageJobLimit,
+  getEncoderCapabilities,
   openExternalUrl,
 } from '@/lib/tauri'
 import { error as logError } from '@/lib/logger'
@@ -40,7 +44,6 @@ import {
   FolderIcon,
   RefreshCw,
   EyeIcon,
-  DatabaseZap,
   Sun,
   Moon,
   Monitor,
@@ -103,7 +106,6 @@ export const Route = createFileRoute('/_app/settings')({
 })
 
 function SettingsPage() {
-  const router = useRouter()
   const loaderData = Route.useLoaderData()
   const { theme, setTheme } = useTheme()
 
@@ -115,6 +117,10 @@ function SettingsPage() {
   const [updateChecksEnabled, setUpdateChecksEnabled] = useState(loaderData.updateChecksEnabled)
 
   const [upscaleSettings, setUpscaleSettings] = useState(loaderData.upscaleSettings)
+  const [maxVideoJobs, setMaxVideoJobs] = useState(2)
+  const [maxImageJobs, setMaxImageJobs] = useState(2)
+  const [hardwareAccel, setHardwareAccel] = useState('auto')
+  const [hardwareOptions, setHardwareOptions] = useState<string[]>([])
 
   const isDownloadingUpscale = useValue('isDownloadingUpscale')
   const upscaleDownloadProgress = useValue('upscaleDownloadProgress')
@@ -165,6 +171,23 @@ function SettingsPage() {
     })
     setInitFfmpeg()
   }, [loaderData, initModel, setInitFfmpeg])
+
+  useEffect(() => {
+    getVideoJobLimit()
+      .then(setMaxVideoJobs)
+      .catch((err) => logError(`Failed to load video concurrency limit: ${err}`))
+    getImageJobLimit()
+      .then(setMaxImageJobs)
+      .catch((err) => logError(`Failed to load image concurrency limit: ${err}`))
+    getEncoderCapabilities()
+      .then((caps) => setHardwareOptions(caps.hardware))
+      .catch((err) => logError(`Failed to detect hardware encoders: ${err}`))
+    getSetting('hardware_acceleration')
+      .then((value) => {
+        if (value) setHardwareAccel(value)
+      })
+      .catch((err) => logError(`Failed to load hardware acceleration setting: ${err}`))
+  }, [])
 
   async function handleInitDatabase() {
     setIsInitializing(true)
@@ -245,9 +268,10 @@ function SettingsPage() {
         {/* Database Status */}
         <Card>
           <CardHeader>
-            <CardTitle>Database Status</CardTitle>
+            <CardTitle>Database</CardTitle>
             <CardDescription>
-              Manage your SQLite database and check for orphaned files
+              Your local SQLite database. Use the DB button in the footer to sync it or the database
+              viewer to browse it.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -270,33 +294,6 @@ function SettingsPage() {
                   <Button variant="outline" size="sm" onClick={handleRevealDbFolder}>
                     <EyeIcon className="mr-2 h-4 w-4" />
                     Reveal Database Folder
-                  </Button>
-
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        const deletedCount = await syncDatabase()
-                        if (deletedCount > 0) {
-                          await addNotification({
-                            message: `Cleaned up ${deletedCount} orphaned records.`,
-                            status: 'success',
-                          })
-                        } else {
-                          await addNotification({
-                            message: 'Database is perfectly in sync with filesystem.',
-                            status: 'info',
-                          })
-                        }
-                        await router.invalidate()
-                      } catch (err) {
-                        logError(`Failed to sync database: ${err}`)
-                      }
-                    }}
-                  >
-                    <DatabaseZap className="mr-2 h-4 w-4" />
-                    Sync / Clean DB
                   </Button>
                 </div>
               </div>
@@ -659,6 +656,119 @@ function SettingsPage() {
                     )}
                   </div>
                 </div>
+              </div>
+            </div>
+
+            <Separator />
+
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <Video className="text-muted-foreground h-5 w-5" />
+                <h3 className="font-semibold">Concurrency</h3>
+                <span className="text-muted-foreground text-xs">
+                  Maximum simultaneous video encodes
+                </span>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-sm">Max concurrent video jobs</Label>
+                <Select
+                  value={String(maxVideoJobs)}
+                  onValueChange={async (value) => {
+                    const limit = Number.parseInt(value, 10)
+                    setMaxVideoJobs(limit)
+                    try {
+                      await setVideoJobLimit(limit)
+                    } catch (err) {
+                      logError(`Failed to save video concurrency limit: ${err}`)
+                    }
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[1, 2, 3, 4, 6, 8].map((n) => (
+                      <SelectItem key={n} value={String(n)}>
+                        {n} at a time
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  Keep this low on laptops so other work stays responsive.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="text-sm">Max concurrent image jobs</Label>
+                <Select
+                  value={String(maxImageJobs)}
+                  onValueChange={async (value) => {
+                    const limit = Number.parseInt(value, 10)
+                    setMaxImageJobs(limit)
+                    try {
+                      await setImageJobLimit(limit)
+                    } catch (err) {
+                      logError(`Failed to save image concurrency limit: ${err}`)
+                    }
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[1, 2, 3, 4, 6, 8].map((n) => (
+                      <SelectItem key={n} value={String(n)}>
+                        {n} at a time
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  Applies to image compress / convert / upscale / background removal.
+                </p>
+              </div>
+            </div>
+
+            <Separator />
+
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <Video className="text-muted-foreground h-5 w-5" />
+                <h3 className="font-semibold">Hardware acceleration</h3>
+                <span className="text-muted-foreground text-xs">Off by default</span>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-sm">Encoder</Label>
+                <Select
+                  value={hardwareAccel}
+                  onValueChange={async (value) => {
+                    setHardwareAccel(value)
+                    try {
+                      await setSetting('hardware_acceleration', value)
+                    } catch (err) {
+                      logError(`Failed to save hardware acceleration: ${err}`)
+                    }
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto (best available)</SelectItem>
+                    <SelectItem value="off">Off (software H.264)</SelectItem>
+                    {hardwareOptions.map((encoder) => (
+                      <SelectItem key={encoder} value={encoder}>
+                        {encoder}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  {hardwareOptions.length > 0
+                    ? 'Only encoders verified by a test encode on this machine are listed. Auto uses the fastest available; falls back to software on failure.'
+                    : 'No verified hardware encoder was found on this machine — software H.264 is used.'}
+                </p>
               </div>
             </div>
           </CardContent>

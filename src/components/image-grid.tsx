@@ -15,7 +15,7 @@ import {
 import { Progress } from '@/components/ui/progress'
 import { Button } from '@/components/ui/button'
 import { formatBytes } from '@/lib/utils'
-import { type Image, revealInExplorer, openFile, deleteImage } from '@/lib/tauri'
+import { type Image, revealInExplorer, openFile, deleteImage, cancelImageJobs } from '@/lib/tauri'
 import { error as logError } from '@/lib/logger'
 import {
   ExternalLink,
@@ -352,6 +352,17 @@ const ImageGridItem = memo(function ImageGridItem({
                     (bgRemovalState.message as string) ||
                     (conversionState.message as string)}
                 </span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    cancelImageJobs([image.id]).catch((err) =>
+                      logError(`Failed to cancel image job: ${err}`)
+                    )
+                  }}
+                  className="mt-1.5 rounded bg-red-600 px-2 py-0.5 text-[10px] text-white hover:bg-red-700"
+                >
+                  Cancel
+                </button>
               </div>
             )}
           </div>

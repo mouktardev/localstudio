@@ -1,7 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import type { DeleteAction } from '@/lib/tauri'
 import {
   Dialog,
   DialogContent,
@@ -31,7 +39,7 @@ interface ImageToolsProps {
   selectedIds: number[]
   onSelectionChange: (ids: number[]) => void
   onImport: () => void
-  onDeleteSelected: (ids: number[]) => void
+  onDeleteSelected: (ids: number[], action: DeleteAction) => void
   onCompressClick: () => void
   onUpscaleClick: () => void
   onBgRemovalClick: () => void
@@ -70,6 +78,14 @@ export function ImageTools({
   onResetFilters,
 }: ImageToolsProps) {
   const [openDeleteDialog, setOpenDeleteDialog] = useState(false)
+  const [deleteAction, setDeleteAction] = useState<DeleteAction>('library')
+
+  useEffect(() => {
+    if (selectedIds.length === 0) {
+      setOpenDeleteDialog(false)
+      setDeleteAction('library')
+    }
+  }, [selectedIds.length])
 
   const handleSelectAll = () => {
     if (selectedIds.length === images.length) {
@@ -80,7 +96,7 @@ export function ImageTools({
   }
 
   const handleDeleteConfirm = () => {
-    onDeleteSelected(selectedIds)
+    onDeleteSelected(selectedIds, deleteAction)
     setOpenDeleteDialog(false)
   }
 
@@ -157,44 +173,62 @@ export function ImageTools({
             </TooltipTrigger>
             <TooltipContent>Remove</TooltipContent>
           </Tooltip>
-
-          <Dialog open={openDeleteDialog} onOpenChange={setOpenDeleteDialog}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Remove selected images?</DialogTitle>
-                <DialogDescription>
-                  You are about to remove {selectedIds.length} image(s) from the app and database.
-                  The original file on your device will not be affected. This action cannot be
-                  undone.
-                </DialogDescription>
-              </DialogHeader>
-              {selectedIds.length > 0 && (
-                <div className="bg-muted max-h-40 overflow-y-auto rounded border p-2">
-                  {selectedImages.map((img) => (
-                    <div
-                      key={img.id}
-                      className="flex items-center justify-between border-b py-1 last:border-b-0"
-                    >
-                      <span className="max-w-50 truncate">{img.filename}</span>
-                      <span className="text-muted-foreground text-xs">
-                        {img.size ? formatBytes(img.size) : 'Unknown'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setOpenDeleteDialog(false)}>
-                  Cancel
-                </Button>
-                <Button variant="destructive" onClick={handleDeleteConfirm}>
-                  Remove
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
         </>
       )}
+
+      {/* Mounted unconditionally so it cannot unmount mid-interaction. */}
+      <Dialog open={openDeleteDialog} onOpenChange={setOpenDeleteDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove selected images?</DialogTitle>
+            <DialogDescription>
+              Choose what happens to {selectedIds.length} image(s). Deleting files is permanent.
+            </DialogDescription>
+          </DialogHeader>
+          {selectedIds.length > 0 && (
+            <div className="bg-muted max-h-40 overflow-y-auto rounded border p-2">
+              {selectedImages.map((img) => (
+                <div
+                  key={img.id}
+                  className="flex items-center justify-between border-b py-1 last:border-b-0"
+                >
+                  <span className="max-w-50 truncate">{img.filename}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {img.size ? formatBytes(img.size) : 'Unknown'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Action</Label>
+            <Select value={deleteAction} onValueChange={(v) => setDeleteAction(v as DeleteAction)}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="library">Remove from library (keep files)</SelectItem>
+                <SelectItem value="outputs">Delete generated outputs (keep originals)</SelectItem>
+                <SelectItem value="all">Delete originals + outputs from disk</SelectItem>
+              </SelectContent>
+            </Select>
+            {deleteAction === 'all' && (
+              <p className="text-destructive text-xs">
+                This permanently deletes files from disk. This cannot be undone.
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpenDeleteDialog(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteConfirm}>
+              Remove
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <div className="ml-auto flex items-center gap-2">
         <Checkbox
           id="select-all"

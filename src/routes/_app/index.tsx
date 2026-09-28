@@ -4,18 +4,21 @@ import { Loader2 } from 'lucide-react'
 import { ImageGrid } from '@/components/image-grid'
 import {
   getAllImages,
-  deleteImagesByIds,
+  deleteItems,
+  deleteOutputs,
   selectFiles,
   importImagesBulk,
-  compressImagesByIds,
-  upscaleImagesByIds,
-  removeBackgroundByIds,
-  convertImagesByIds,
+  compressImagesByIdsV2,
+  upscaleImagesByIdsV2,
+  removeBackgroundByIdsV2,
+  convertImagesByIdsV2,
   checkDbHealth,
   getFilters,
   updateFilters,
   resetFilters,
+  type DeleteAction,
   type Image,
+  type ImageBatchResult,
   type ImageFormat,
 } from '@/lib/tauri'
 import {
@@ -258,17 +261,25 @@ function IndexPage() {
     }
   }
 
-  const handleDeleteSelected = useCallback(async (ids: number[]) => {
+  const handleDeleteSelected = useCallback(async (ids: number[], action: DeleteAction) => {
     try {
       const count = ids.length
-      await deleteImagesByIds(ids)
+      const report =
+        action === 'outputs'
+          ? await deleteOutputs('image', ids)
+          : await deleteItems('image', ids, action === 'all')
       setSelectedIds([])
       await clearSelections()
       setImages((prev) => prev.filter((img) => !ids.includes(img.id)))
-      await addNotification({
-        message: `Removed ${count} image${count > 1 ? 's' : ''}`,
-        status: 'success',
-      })
+
+      const parts = [
+        action === 'outputs'
+          ? `Deleted generated outputs for ${count} image${count > 1 ? 's' : ''}`
+          : `Removed ${count} image${count > 1 ? 's' : ''}`,
+      ]
+      if (report.files_deleted > 0) parts.push(`${report.files_deleted} file(s) deleted`)
+      if (report.skipped.length > 0) parts.push(`${report.skipped.length} file(s) kept`)
+      await addNotification({ message: parts.join(' · '), status: 'success' })
     } catch (err) {
       logError(`Failed to delete images: ${err}`)
     }
@@ -288,66 +299,84 @@ function IndexPage() {
     [selectedIds]
   )
 
-  const handleCompressSelected = useCallback(async (ids: number[], quality: number) => {
-    try {
-      const count = ids.length
-      await compressImagesByIds(ids, quality)
-      const updated = await getAllImages()
-      setImages(updated)
-      await addNotification({
-        message: `Compressed ${count} image${count > 1 ? 's' : ''}`,
-        status: 'success',
-      })
-    } catch (err) {
-      logError(`Failed to compress images: ${err}`)
-    }
-  }, [])
+  // Image jobs report real per-file outcomes now, so failures are never silent.
+  const notifyImageBatch = useCallback(
+    async (verb: string, result: ImageBatchResult, suffix = '') => {
+      if (result.failed > 0) {
+        const first = result.errors[0]?.message
+        await addNotification({
+          message: `${verb} ${result.processed}, failed ${result.failed}${first ? ` — ${first}` : ''}`,
+          status: 'error',
+        })
+      } else if (result.processed > 0) {
+        await addNotification({
+          message: `${verb} ${result.processed} image${result.processed === 1 ? '' : 's'}${suffix}`,
+          status: 'success',
+        })
+      } else if (result.cancelled > 0) {
+        await addNotification({
+          message: `Cancelled ${result.cancelled} job${result.cancelled === 1 ? '' : 's'}`,
+          status: 'info',
+        })
+      } else {
+        await addNotification({ message: `${verb}: nothing to do`, status: 'info' })
+      }
+    },
+    []
+  )
 
-  const handleUpscaleSelected = useCallback(async (ids: number[], scale: number, model: string) => {
-    try {
-      const count = ids.length
-      await upscaleImagesByIds(ids, scale, model)
-      const updated = await getAllImages()
-      setImages(updated)
-      await addNotification({
-        message: `Upscaled ${count} image${count > 1 ? 's' : ''} with ${model}`,
-        status: 'success',
-      })
-    } catch (err) {
-      logError(`Failed to upscale images: ${err}`)
-    }
-  }, [])
+  const handleCompressSelected = useCallback(
+    async (ids: number[], quality: number) => {
+      try {
+        const result = await compressImagesByIdsV2(ids, quality)
+        await notifyImageBatch('Compressed', result)
+        setImages(await getAllImages())
+      } catch (err) {
+        logError(`Failed to compress images: ${err}`)
+      }
+    },
+    [notifyImageBatch]
+  )
 
-  const handleRemoveBackgroundSelected = useCallback(async (ids: number[]) => {
-    try {
-      const count = ids.length
-      await removeBackgroundByIds(ids)
-      const updated = await getAllImages()
-      setImages(updated)
-      await addNotification({
-        message: `Removed background from ${count} image${count > 1 ? 's' : ''}`,
-        status: 'success',
-      })
-    } catch (err) {
-      logError(`Failed to remove backgrounds: ${err}`)
-    }
-  }, [])
+  const handleUpscaleSelected = useCallback(
+    async (ids: number[], scale: number, model: string) => {
+      try {
+        const result = await upscaleImagesByIdsV2(ids, scale, model)
+        await notifyImageBatch('Upscaled', result, ` with ${model}`)
+        setImages(await getAllImages())
+      } catch (err) {
+        logError(`Failed to upscale images: ${err}`)
+      }
+    },
+    [notifyImageBatch]
+  )
+
+  const handleRemoveBackgroundSelected = useCallback(
+    async (ids: number[]) => {
+      try {
+        const result = await removeBackgroundByIdsV2(ids)
+        await notifyImageBatch('Removed background from', result)
+        setImages(await getAllImages())
+      } catch (err) {
+        logError(`Failed to remove backgrounds: ${err}`)
+      }
+    },
+    [notifyImageBatch]
+  )
 
   // Dialog open handlers
-  const handleConvertSelected = useCallback(async (ids: number[], format: string) => {
-    try {
-      const count = ids.length
-      await convertImagesByIds(ids, format as ImageFormat)
-      const updated = await getAllImages()
-      setImages(updated)
-      await addNotification({
-        message: `Converted ${count} image${count > 1 ? 's' : ''} to ${format.toUpperCase()}`,
-        status: 'success',
-      })
-    } catch (err) {
-      logError(`Failed to convert images: ${err}`)
-    }
-  }, [])
+  const handleConvertSelected = useCallback(
+    async (ids: number[], format: string) => {
+      try {
+        const result = await convertImagesByIdsV2(ids, format as ImageFormat)
+        await notifyImageBatch('Converted', result, ` to ${format.toUpperCase()}`)
+        setImages(await getAllImages())
+      } catch (err) {
+        logError(`Failed to convert images: ${err}`)
+      }
+    },
+    [notifyImageBatch]
+  )
 
   const openCompressDialog = useCallback((ids: number[]) => {
     setDialogImageIds(ids)

@@ -1,10 +1,27 @@
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute, Link, useRouter } from '@tanstack/react-router'
 import { Button } from '@/components/ui/button'
-import { ArrowLeft, ExternalLink, FolderSearch } from 'lucide-react'
-import { getImageById, openFile, revealInExplorer } from '@/lib/tauri'
+import { ArrowLeft, ExternalLink, FolderSearch, Trash2 } from 'lucide-react'
+import {
+  getImageById,
+  getCompressedVariants,
+  deleteOutput,
+  openFile,
+  revealInExplorer,
+} from '@/lib/tauri'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { error as logError } from '@/lib/logger'
-import { useCallback, useMemo } from 'react'
+import { addNotification } from '@/lib/notifications'
+import { useCallback, useMemo, useState } from 'react'
 import { cn, formatBytes } from '@/lib/utils'
 
 interface UpscaledVersion {
@@ -27,8 +44,12 @@ export const Route = createFileRoute('/_app/$imageId/')({
     view: search.view || 'original',
   }),
   loader: async ({ params }) => {
-    const image = await getImageById(parseInt(params.imageId))
-    return { image }
+    const id = parseInt(params.imageId)
+    const [image, compressedVariants] = await Promise.all([
+      getImageById(id),
+      getCompressedVariants('image', id),
+    ])
+    return { image, compressedVariants }
   },
   component: ImagePage,
   errorComponent: () => (
@@ -48,9 +69,10 @@ export const Route = createFileRoute('/_app/$imageId/')({
 })
 
 function ImagePage() {
-  const { image } = Route.useLoaderData()
+  const { image, compressedVariants } = Route.useLoaderData()
   const { view } = Route.useSearch()
   const navigate = Route.useNavigate()
+  const router = useRouter()
 
   const parsedUpscaled: UpscaledVersion[] = useMemo(() => {
     const raw = image.upscaled_versions
@@ -69,7 +91,19 @@ function ImagePage() {
     const list: VersionItem[] = [
       { id: 'original', label: 'Original', filepath: image.filepath, size: image.size },
     ]
-    if (image.compressed_filepath) {
+    const seenCompressed = new Set<string>()
+    compressedVariants.forEach((v) => {
+      if (!v.filepath || seenCompressed.has(v.filepath)) return
+      seenCompressed.add(v.filepath)
+      list.push({
+        id: `compressed-${v.id}`,
+        label: v.label || 'Compressed',
+        filepath: v.filepath,
+        size: v.size ?? null,
+      })
+    })
+    // Legacy fallback for rows that predate variant metadata.
+    if (image.compressed_filepath && !seenCompressed.has(image.compressed_filepath)) {
       list.push({
         id: 'compressed',
         label: 'Compressed',
@@ -103,9 +137,38 @@ function ImagePage() {
       })
     })
     return list
-  }, [image, parsedUpscaled])
+  }, [image, parsedUpscaled, compressedVariants])
 
-  const currentVersion = versions.find((v) => v.id === view) || versions[0]
+  // `view` may be a tab id or a filepath (used by the Output page links).
+  const currentVersion =
+    versions.find((v) => v.id === view) || versions.find((v) => v.filepath === view) || versions[0]
+
+  // Per-variant delete is offered for compressed variants (multi-variant case).
+  const compressedVariantId = currentVersion.id.startsWith('compressed-')
+    ? Number.parseInt(currentVersion.id.slice('compressed-'.length), 10)
+    : null
+
+  const [confirmDeleteVariant, setConfirmDeleteVariant] = useState(false)
+
+  const handleDeleteVariant = useCallback(async () => {
+    if (compressedVariantId == null) return
+    try {
+      const report = await deleteOutput('compressed_image', compressedVariantId)
+      await addNotification({
+        message: `Deleted compressed variant (${report.files_deleted} file(s), ${formatBytes(report.bytes_freed)} freed).`,
+        status: 'success',
+      })
+      setConfirmDeleteVariant(false)
+      await router.invalidate()
+      navigate({ search: { view: 'original' }, replace: true })
+    } catch (err) {
+      logError(`Failed to delete variant: ${err}`)
+      await addNotification({
+        message: `Failed to delete variant: ${err}`,
+        status: 'error',
+      })
+    }
+  }, [compressedVariantId, navigate, router])
 
   const handleBack = useCallback(() => {
     navigate({ to: '/', viewTransition: { types: ['slide-right'] } })
@@ -152,14 +215,12 @@ function ImagePage() {
           <ArrowLeft className="size-5" />
         </Button>
         <h1 className="max-w-[180px] shrink-0 truncate text-sm font-semibold">{image.filename}</h1>
+        {versions.length > 1 && <div className="bg-border w-px shrink-0 self-stretch" />}
         {versions.length > 1 && (
-          <div className="w-px shrink-0 self-stretch bg-border" />
-        )}
-        {versions.length > 1 && (
-          <div className="flex min-w-0 shrink items-center gap-0 overflow-x-auto self-stretch">
+          <div className="flex min-w-0 shrink items-center gap-0 self-stretch overflow-x-auto">
             {versions.map((v, i) => (
               <div key={v.id} className="flex items-center gap-0 self-stretch">
-                {i > 0 && <div className="mx-1.5 w-px self-stretch bg-muted-foreground/20" />}
+                {i > 0 && <div className="bg-muted-foreground/20 mx-1.5 w-px self-stretch" />}
                 <button
                   type="button"
                   onClick={() => handleTabChange(v.id)}
@@ -167,7 +228,7 @@ function ImagePage() {
                     'shrink-0 text-[0.7rem] font-medium transition-colors',
                     view === v.id
                       ? 'text-foreground'
-                      : 'text-muted-foreground hover:text-foreground',
+                      : 'text-muted-foreground hover:text-foreground'
                   )}
                 >
                   {v.label}
@@ -204,6 +265,17 @@ function ImagePage() {
           </span>
         )}
         <div className="flex items-center gap-1">
+          {compressedVariantId != null && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-destructive h-7 gap-1.5 text-xs"
+              onClick={() => setConfirmDeleteVariant(true)}
+            >
+              <Trash2 className="size-3.5" />
+              Delete variant
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -224,6 +296,21 @@ function ImagePage() {
           </Button>
         </div>
       </div>
+
+      <AlertDialog open={confirmDeleteVariant} onOpenChange={setConfirmDeleteVariant}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this compressed variant?</AlertDialogTitle>
+            <AlertDialogDescription>
+              The generated file is removed from disk. Your original image is kept.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteVariant}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

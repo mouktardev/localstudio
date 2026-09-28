@@ -13,7 +13,7 @@ import {
 } from '@/schema/tinybase-schema'
 import { createQueries, createStore } from 'tinybase/with-schemas'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { setupLogger, attachGlobalLogListener } from '@/lib/logger'
+import { setupLogger, startLogWatcher } from '@/lib/logger'
 import { checkDbHealth } from '@/lib/tauri'
 import { useEffect } from 'react'
 
@@ -36,7 +36,7 @@ export function App() {
 
   useEffect(() => {
     if (store) {
-      const promise = attachGlobalLogListener(store)
+      const stopLogWatcher = startLogWatcher(store)
 
       // Check DB health on startup
       checkDbHealth()
@@ -48,7 +48,7 @@ export function App() {
         .catch(console.error)
 
       return () => {
-        promise.then((detach) => detach())
+        stopLogWatcher()
       }
     }
   }, [store])

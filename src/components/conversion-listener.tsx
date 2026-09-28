@@ -3,10 +3,19 @@ import { useRouter } from '@tanstack/react-router'
 import { listen } from '@tauri-apps/api/event'
 import { useSetRowCallback, useDelRowCallback } from '@/schema/tinybase-schema'
 
-interface ConversionProgress {
+interface ImageConversionProgress {
   id: number
   progress: number
   message: string
+  stage?: string
+  status?: string
+}
+
+interface VideoConversionProgress extends ImageConversionProgress {
+  stage?: string
+  status?: string
+  speed?: number | null
+  eta_seconds?: number | null
 }
 
 export function ConversionListener() {
@@ -14,47 +23,58 @@ export function ConversionListener() {
 
   const setImageConversion = useSetRowCallback(
     'image_conversions',
-    (param: ConversionProgress) => param.id.toString(),
-    (param: ConversionProgress) => ({ progress: param.progress, message: param.message }),
+    (param: ImageConversionProgress) => param.id.toString(),
+    (param: ImageConversionProgress) => ({ progress: param.progress, message: param.message }),
     []
   )
 
-  const delImageConversion = useDelRowCallback('image_conversions', (param: ConversionProgress) =>
-    param.id.toString()
+  const delImageConversion = useDelRowCallback(
+    'image_conversions',
+    (param: ImageConversionProgress) => param.id.toString()
   )
 
   const setVideoConversion = useSetRowCallback(
     'video_conversions',
-    (param: ConversionProgress) => param.id.toString(),
-    (param: ConversionProgress) => ({ progress: param.progress, message: param.message }),
+    (param: VideoConversionProgress) => param.id.toString(),
+    (param: VideoConversionProgress) => ({
+      progress: param.progress,
+      message: param.message,
+      stage: param.stage ?? '',
+      status: param.status ?? 'running',
+      eta_seconds: param.eta_seconds ?? 0,
+      speed: param.speed ?? 0,
+    }),
     []
   )
 
-  const delVideoConversion = useDelRowCallback('video_conversions', (param: ConversionProgress) =>
-    param.id.toString()
+  const delVideoConversion = useDelRowCallback(
+    'video_conversions',
+    (param: VideoConversionProgress) => param.id.toString()
   )
 
   useEffect(() => {
-    const unlistenImageProgress = listen<ConversionProgress>(
+    const unlistenImageProgress = listen<ImageConversionProgress>(
       'image-conversion-progress',
       (event) => {
-        const { id, progress, message } = event.payload
-        if (progress === 100 || progress === 0) {
-          delImageConversion({ id, progress: 0, message: '' })
+        const payload = event.payload
+        const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+        if (status === 'done' || status === 'failed' || status === 'cancelled') {
+          delImageConversion({ ...payload, status })
         } else {
-          setImageConversion({ id, progress, message })
+          setImageConversion(payload)
         }
       }
     )
 
-    const unlistenVideoProgress = listen<ConversionProgress>(
+    const unlistenVideoProgress = listen<VideoConversionProgress>(
       'video-conversion-progress',
       (event) => {
-        const { id, progress, message } = event.payload
-        if (progress === 100 || progress === 0) {
-          delVideoConversion({ id, progress: 0, message: '' })
+        const payload = event.payload
+        const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+        if (status === 'done' || status === 'failed' || status === 'cancelled') {
+          delVideoConversion({ ...payload, status })
         } else {
-          setVideoConversion({ id, progress, message })
+          setVideoConversion(payload)
         }
       }
     )

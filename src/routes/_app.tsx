@@ -3,6 +3,7 @@ import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/s
 import { AppSidebar } from '@/components/app-sidebar'
 import { NotificationBell } from '@/components/notification-bell'
 import { LogPanel } from '@/components/log-panel'
+import { DatabaseViewerPanel } from '@/components/db-viewer-panel'
 import { CompressionListener } from '@/components/compression-listener'
 import { UpscalingListener } from '@/components/upscaling-listener'
 import { BgRemovalListener } from '@/components/bg-removal-listener'
@@ -20,6 +21,7 @@ export const Route = createFileRoute('/_app')({
 
 function RouteComponent() {
   const logsOpen = useValue('logsOpen')
+  const dbViewerOpen = useValue('dbViewerOpen')
 
   return (
     <SidebarProvider defaultOpen style={{ '--sidebar-width': '14rem' } as React.CSSProperties}>
@@ -48,6 +50,7 @@ function RouteComponent() {
           <UpdateChecker />
         </footer>
         {logsOpen && <LogPanel />}
+        {dbViewerOpen && <DatabaseViewerPanel />}
       </SidebarInset>
     </SidebarProvider>
   )

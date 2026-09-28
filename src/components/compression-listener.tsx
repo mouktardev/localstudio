@@ -7,6 +7,8 @@ interface CompressionProgress {
   id: number
   progress: number
   message: string
+  stage?: string
+  status?: string
 }
 
 export function CompressionListener() {
@@ -25,11 +27,12 @@ export function CompressionListener() {
 
   useEffect(() => {
     const unlistenProgress = listen<CompressionProgress>('compression-progress', (event) => {
-      const { id, progress, message } = event.payload
-      if (progress === 100 || progress === 0) {
-        delCompression({ id, progress: 0, message: '' })
+      const payload = event.payload
+      const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+      if (status === 'done' || status === 'failed' || status === 'cancelled') {
+        delCompression({ ...payload, status })
       } else {
-        setCompression({ id, progress, message })
+        setCompression(payload)
       }
     })
 

@@ -18,10 +18,9 @@ pub fn get_db_url(app: &AppHandle) -> Result<String> {
 
 pub async fn init_db(app: &AppHandle) -> Result<(SqlitePool, PathBuf)> {
     let db_path = get_db_path(app)?;
-    let db_url = get_db_url(app)?;
 
     ensure_database(&db_path)?;
-    let pool = create_pool(&db_url).await?;
+    let pool = create_pool(&db_path).await?;
     run_migrations(&pool, app).await?;
 
     println!("[DB] Initialized at: {:?}", db_path);

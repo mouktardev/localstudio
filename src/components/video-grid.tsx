@@ -1,7 +1,14 @@
 import { useState, useCallback, memo, useEffect } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { type Video, revealInExplorer, openFile, cancelVideoBgRemoval } from '@/lib/tauri'
+import {
+  type Video,
+  revealInExplorer,
+  openFile,
+  cancelVideoBgRemoval,
+  cancelVideoCompression,
+  cancelVideoConversion,
+} from '@/lib/tauri'
 import { error as logError } from '@/lib/logger'
 import {
   ContextMenu,
@@ -102,16 +109,18 @@ const VideoGridItem = memo(function VideoGridItem({
       : null
 
   const handleCancel = useCallback(async () => {
-    if (isCompressing) {
-      // TODO: Add cancel_video_compression command
-      return
-    }
     try {
-      await cancelVideoBgRemoval([video.id])
+      if (isCompressing) {
+        await cancelVideoCompression([video.id])
+      } else if (isConverting) {
+        await cancelVideoConversion([video.id])
+      } else {
+        await cancelVideoBgRemoval([video.id])
+      }
     } catch (e) {
       logError(`Failed to cancel: ${e}`)
     }
-  }, [video.id, isCompressing])
+  }, [video.id, isCompressing, isConverting])
 
   const formatEta = (seconds: number) => {
     if (seconds < 60) return `${Math.round(seconds)}s`
@@ -250,6 +259,20 @@ const VideoGridItem = memo(function VideoGridItem({
                 <span className="text-xs text-white">
                   {compressionState.message || 'Compressing...'}
                 </span>
+                {(compressionState.eta_seconds as number) > 0 && (
+                  <span className="text-[10px] text-white/70">
+                    ~{Math.round(compressionState.eta_seconds as number)}s left
+                  </span>
+                )}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleCancel()
+                  }}
+                  className="mt-1 rounded bg-red-600 px-2 py-0.5 text-[10px] text-white hover:bg-red-700"
+                >
+                  Cancel
+                </button>
               </div>
             )}
 
@@ -259,6 +282,20 @@ const VideoGridItem = memo(function VideoGridItem({
                 <span className="text-xs text-white">
                   {conversionState.message || 'Converting...'}
                 </span>
+                {(conversionState.eta_seconds as number) > 0 && (
+                  <span className="text-[10px] text-white/70">
+                    ~{Math.round(conversionState.eta_seconds as number)}s left
+                  </span>
+                )}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleCancel()
+                  }}
+                  className="mt-1 rounded bg-red-600 px-2 py-0.5 text-[10px] text-white hover:bg-red-700"
+                >
+                  Cancel
+                </button>
               </div>
             )}
 

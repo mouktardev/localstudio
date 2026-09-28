@@ -1,11 +1,14 @@
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use image::GenericImageView;
 use crate::DbState;
 use crate::crud::models;
+use crate::crud::image_pipeline::{
+    self, build_batch, emit_progress, ImageBatchResult, ImageFileResult, ImageJobLimiter,
+};
 use futures::{stream, StreamExt};
 
 #[derive(Clone, Serialize)]
@@ -80,76 +83,257 @@ pub async fn download_model(
 }
 
 fn run_upscaling_inference(
-    input_path: &PathBuf,
-    output_path: &PathBuf,
-    model_path: &PathBuf,
-    app: Option<AppHandle>,
-    image_id: i64,
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+    model_path: &std::path::Path,
 ) -> Result<()> {
     let img = image::open(input_path).context("Failed to open image")?;
     let (width, height) = img.dimensions();
-    
-    if let Some(ref app) = app {
-        let _ = app.emit("upscale-progress", models::DownloadProgress {
-            id: image_id,
-            progress: 25,
-            message: format!("{}x{} - Upscaling...", width, height),
-        });
-    }
-    
-    let scale = if model_path.to_string_lossy().contains("x2") { 2 } else { 4 };
+
+    let scale = if model_path.to_string_lossy().contains("x2") {
+        2
+    } else {
+        4
+    };
     let new_width = width * scale;
     let new_height = height * scale;
-    
+
     if let Some(parent) = output_path.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent).context("Failed to create output directory")?;
         }
     }
-    
+
     let resized = img.resize_exact(new_width, new_height, image::imageops::FilterType::Lanczos3);
-    
-    if let Some(ref app) = app {
-        let _ = app.emit("upscale-progress", models::DownloadProgress {
-            id: image_id,
-            progress: 60,
-            message: "Saving...".to_string(),
-        });
-    }
-    
+
     // Get extension from INPUT file (not .tmp output)
     let ext = input_path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_else(|| "jpg".to_string());
-    
-    // Use explicit encoding like compression does
+
     let mut out_file = fs::File::create(output_path).context("Failed to create output file")?;
-    
+
     if ext == "jpg" || ext == "jpeg" {
         let mut encoder = jpeg_encoder::Encoder::new(&mut out_file, 95);
         encoder.set_optimized_huffman_tables(true);
         encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
-        
         let img_rgb = resized.to_rgb8();
-        encoder.encode(img_rgb.as_raw(), img_rgb.width() as u16, img_rgb.height() as u16, jpeg_encoder::ColorType::Rgb).context("JPEG Encode failed")?;
+        encoder
+            .encode(
+                img_rgb.as_raw(),
+                img_rgb.width() as u16,
+                img_rgb.height() as u16,
+                jpeg_encoder::ColorType::Rgb,
+            )
+            .context("JPEG Encode failed")?;
     } else if ext == "png" {
         let rgba = resized.to_rgba8();
-        let mut encoder = png::Encoder::new(&mut out_file, rgba.width() as u32, rgba.height() as u32);
+        let mut encoder = png::Encoder::new(&mut out_file, rgba.width(), rgba.height());
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        
         let mut writer = encoder.write_header().context("Failed to write PNG header")?;
-        writer.write_image_data(rgba.as_raw()).context("Failed to write PNG data")?;
+        writer
+            .write_image_data(rgba.as_raw())
+            .context("Failed to write PNG data")?;
     } else {
-        // Default: use image crate's save for other formats (WebP, etc.)
         resized.save(output_path).context("Failed to save image")?;
     }
-    
+
     out_file.sync_all().context("Failed to sync file to disk")?;
-    
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upscale_one(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    scale: u32,
+    model: &str,
+    model_path: &std::path::Path,
+    output_dir: &Option<String>,
+    limiter: ImageJobLimiter,
+) -> ImageFileResult {
+    let record: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT filepath, size FROM images WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+    let Some((filepath, source_size)) = record else {
+        return ImageFileResult::failed(id, "Image not found".to_string());
+    };
+
+    let orig_path = PathBuf::from(&filepath);
+    if !orig_path.exists() {
+        return ImageFileResult::failed(id, "Source file is missing".to_string());
+    }
+
+    let file_stem = orig_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let ext = orig_path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let scale_str = if scale == 2 { "x2" } else { "x4" };
+    let new_filename = format!("{}_upscaled_{}.{}", file_stem, scale_str, ext);
+
+    let final_filepath = match output_dir {
+        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&new_filename),
+        _ => orig_path.with_file_name(&new_filename),
+    };
+    let temp_filepath = final_filepath.with_file_name(format!("{}.tmp", new_filename));
+
+
+    emit_progress(app, "upscale-progress", id, 5, "encoding", "running", "Upscaling...");
+
+    let (_permit, queue_position) = limiter.acquire().await;
+    if queue_position > 0 {
+        emit_progress(
+            app,
+            "upscale-progress",
+            id,
+            0,
+            "queued",
+            "running",
+            &format!("Queued (position {})", queue_position + 1),
+        );
+    }
+
+    let token = image_pipeline::token_for(app, id);
+    if image_pipeline::is_cancelled(&token) {
+        let _ = fs::remove_file(&temp_filepath);
+        emit_progress(app, "upscale-progress", id, 0, "cancelled", "cancelled", "Cancelled");
+        return ImageFileResult::cancelled(id, source_size);
+    }
+
+    let orig_for_blocking = orig_path.clone();
+    let temp_for_blocking = temp_filepath.clone();
+    let model_for_blocking = model_path.to_path_buf();
+    let upscale = tauri::async_runtime::spawn_blocking(move || {
+        run_upscaling_inference(&orig_for_blocking, &temp_for_blocking, &model_for_blocking)
+    })
+    .await;
+
+    match upscale {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = fs::remove_file(&temp_filepath);
+            let message = format!("Upscaling failed: {}", e);
+            emit_progress(app, "upscale-progress", id, 0, "error", "failed", "Failed");
+            return ImageFileResult::failed(id, message);
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&temp_filepath);
+            let message = format!("Task failed: {}", e);
+            emit_progress(app, "upscale-progress", id, 0, "error", "failed", "Failed");
+            return ImageFileResult::failed(id, message);
+        }
+    }
+
+    if final_filepath.exists() {
+        let _ = fs::remove_file(&final_filepath);
+    }
+    if let Err(e) = fs::rename(&temp_filepath, &final_filepath) {
+        let _ = fs::remove_file(&temp_filepath);
+        let message = format!("Failed to finalize output: {}", e);
+        emit_progress(app, "upscale-progress", id, 0, "error", "failed", "Failed");
+        return ImageFileResult::failed(id, message);
+    }
+
+    let size = fs::metadata(&final_filepath).map(|m| m.len() as i64).ok();
+    let fp = dunce::canonicalize(&final_filepath)
+        .unwrap_or_else(|_| final_filepath.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let insert = sqlx::query(
+        "INSERT OR REPLACE INTO upscaled_images \
+         (original_id, filepath, scale_factor, model_used, size, status, completed_at) \
+         VALUES (?, ?, ?, ?, ?, 'done', datetime('now'))",
+    )
+    .bind(id)
+    .bind(&fp)
+    .bind(scale as i64)
+    .bind(model)
+    .bind(size)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = insert {
+        let message = format!("Failed to save result: {}", e);
+        emit_progress(app, "upscale-progress", id, 0, "error", "failed", "Failed");
+        return ImageFileResult::failed(id, message);
+    }
+
+    emit_progress(app, "upscale-progress", id, 100, "done", "done", "Done");
+    let _ = app.emit("images-updated", ());
+
+    ImageFileResult {
+        id,
+        status: "done".to_string(),
+        message: None,
+        output_path: Some(fp),
+        size,
+        source_size,
+    }
+}
+
+async fn upscale_images_inner(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    ids: Vec<i64>,
+    scale: u32,
+    model: String,
+) -> Result<ImageBatchResult, String> {
+    let (model_path, _model_size) = check_model_downloaded(app, &model)?;
+
+    let output_dir_setting: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'output'")
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+
+    let limiter = app.state::<ImageJobLimiter>().inner().clone();
+    let ids_cleanup = ids.clone();
+    image_pipeline::register_tokens(app, &ids);
+
+    let results: Vec<ImageFileResult> = stream::iter(ids)
+        .map(|id| {
+            let app = app.clone();
+            let pool = pool.clone();
+            let output_dir_setting = output_dir_setting.clone();
+            let limiter = limiter.clone();
+            let model = model.clone();
+            let model_path = model_path.clone();
+            async move {
+                upscale_one(
+                    &app,
+                    &pool,
+                    id,
+                    scale,
+                    &model,
+                    &model_path,
+                    &output_dir_setting,
+                    limiter,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(num_cpus::get().max(2))
+        .collect()
+        .await;
+
+    image_pipeline::clear_tokens(app, &ids_cleanup);
+    Ok(build_batch(results))
 }
 
 #[tauri::command]
@@ -160,138 +344,19 @@ pub async fn upscale_images_by_ids(
     scale: u32,
     model: String,
 ) -> Result<usize, String> {
-    let pool = state.0.clone();
-    
-    // Use internal helper function instead of Tauri command
-    let (model_path, _model_size) = check_model_downloaded(&app, &model)?;
-    
-    let output_dir_setting: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'output'")
-        .fetch_optional(&pool)
-        .await
-        .unwrap_or(None);
+    let result = upscale_images_inner(&app, &state.0, ids, scale, model).await?;
+    Ok(result.processed)
+}
 
-    let concurrency_limit = num_cpus::get().max(2);
-
-    let results: Vec<bool> = stream::iter(ids.into_iter())
-        .map(|id| {
-            let app_clone = app.clone();
-            let pool_clone = pool.clone();
-            let output_dir_clone = output_dir_setting.clone();
-            let model_path_clone = model_path.clone();
-            let model_clone = model.clone();
-            
-            async move {
-                let image_record: Option<(String,)> = sqlx::query_as("SELECT filepath FROM images WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&pool_clone)
-                    .await
-                    .ok()
-                    .flatten();
-
-                if let Some((filepath,)) = image_record {
-                    let _ = app_clone.emit("upscale-progress", models::DownloadProgress {
-                        id,
-                        progress: 10,
-                        message: "Reading...".to_string(),
-                    });
-
-                    let orig_path = PathBuf::from(&filepath);
-                    if !orig_path.exists() {
-                        return false;
-                    }
-
-                    let file_stem = orig_path.file_stem().unwrap_or_default().to_string_lossy();
-                    let ext = orig_path.extension().unwrap_or_default().to_string_lossy().into_owned();
-                    let scale_str = if scale == 2 { "x2" } else { "x4" };
-                    let new_filename = format!("{}_upscaled_{}.{}", file_stem, scale_str, ext);
-                    
-                    let final_filepath = match &output_dir_clone {
-                        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&new_filename),
-                        _ => orig_path.with_file_name(&new_filename),
-                    };
-
-                    let temp_filename = format!("{}.tmp", new_filename);
-                    let temp_filepath = match &output_dir_clone {
-                        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&temp_filename),
-                        _ => orig_path.with_file_name(&temp_filename),
-                    };
-
-                    let _ = app_clone.emit("upscale-progress", models::DownloadProgress {
-                        id,
-                        progress: 20,
-                        message: "Processing...".to_string(),
-                    });
-
-                    let temp_filepath_clone = temp_filepath.clone();
-                    let app_for_blocking = app_clone.clone();
-                    let upscale_result = tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-                        run_upscaling_inference(
-                            &orig_path,
-                            &temp_filepath_clone,
-                            &model_path_clone,
-                            Some(app_for_blocking),
-                            id,
-                        )
-                    }).await;
-
-                    match upscale_result {
-                        Ok(Ok(_)) => {
-                            if let Err(e) = fs::rename(&temp_filepath, &final_filepath) {
-                                log::error!("Failed to rename temp file: {}", e);
-                                let _ = fs::remove_file(&temp_filepath);
-                                return false;
-                            }
-
-                            let size = fs::metadata(&final_filepath).map(|m| m.len() as i64).ok();
-                            let fp = dunce::canonicalize(&final_filepath).unwrap_or(final_filepath).to_string_lossy().to_string();
-                            
-                            let insert_result = sqlx::query(
-                                "INSERT OR REPLACE INTO upscaled_images (original_id, filepath, scale_factor, model_used, size) VALUES (?, ?, ?, ?, ?)"
-                            )
-                            .bind(id)
-                            .bind(fp)
-                            .bind(scale as i64)
-                            .bind(model_clone)
-                            .bind(size)
-                            .execute(&pool_clone)
-                            .await;
-
-                            if insert_result.is_ok() {
-                                let _ = app_clone.emit("upscale-progress", models::DownloadProgress {
-                                    id,
-                                    progress: 100,
-                                    message: "Done".to_string(),
-                                });
-                                let _ = app_clone.emit("images-updated", ());
-                                return true;
-                            }
-                        },
-                        Ok(Err(e)) => {
-                            log::error!("Upscaling error for ID {}: {}", id, e);
-                            let _ = fs::remove_file(&temp_filepath);
-                        },
-                        Err(e) => {
-                            log::error!("Tokio spawn error for ID {}: {}", id, e);
-                            let _ = fs::remove_file(&temp_filepath);
-                        }
-                    }
-                    
-                    let _ = app_clone.emit("upscale-progress", models::DownloadProgress {
-                        id,
-                        progress: 0,
-                        message: "Failed".to_string(),
-                    });
-                }
-                false
-            }
-        })
-        .buffer_unordered(concurrency_limit)
-        .collect()
-        .await;
-
-    let upscaled_count = results.into_iter().filter(|&success| success).count();
-
-    Ok(upscaled_count)
+#[tauri::command]
+pub async fn upscale_images_by_ids_v2(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    ids: Vec<i64>,
+    scale: u32,
+    model: String,
+) -> Result<ImageBatchResult, String> {
+    upscale_images_inner(&app, &state.0, ids, scale, model).await
 }
 
 #[tauri::command]

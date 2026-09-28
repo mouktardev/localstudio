@@ -7,6 +7,8 @@ interface UpscaleProgress {
   id: number
   progress: number
   message: string
+  stage?: string
+  status?: string
 }
 
 export function UpscalingListener() {
@@ -25,11 +27,12 @@ export function UpscalingListener() {
 
   useEffect(() => {
     const unlistenProgress = listen<UpscaleProgress>('upscale-progress', (event) => {
-      const { id, progress, message } = event.payload
-      if (progress === 100 || progress === 0) {
-        delUpscaling({ id, progress: 0, message: '' })
+      const payload = event.payload
+      const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+      if (status === 'done' || status === 'failed' || status === 'cancelled') {
+        delUpscaling({ ...payload, status })
       } else {
-        setUpscaling({ id, progress, message })
+        setUpscaling(payload)
       }
     })
 

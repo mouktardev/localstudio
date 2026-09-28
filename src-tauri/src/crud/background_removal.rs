@@ -1,12 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use anyhow::{Context, Result};
 
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
 use crate::DbState;
 use crate::crud::models;
+use crate::crud::image_pipeline::{
+    self, build_batch, emit_progress, ImageBatchResult, ImageFileResult, ImageJobLimiter,
+};
 use futures::{stream, StreamExt};
 use ort::{Environment, SessionBuilder, Value};
 use ndarray::{Array, Axis};
@@ -38,7 +41,7 @@ pub async fn download_bg_removal_model(
     Ok(model_path.to_string_lossy().to_string())
 }
 
-pub fn create_onnx_session(model_path: &PathBuf) -> Result<ort::Session> {
+pub fn create_onnx_session(model_path: &std::path::Path) -> Result<ort::Session> {
     let environment = Arc::new(
         Environment::builder()
             .build()
@@ -109,9 +112,9 @@ pub fn apply_bg_removal(
 }
 
 fn run_bg_removal_inference(
-    input_path: &PathBuf,
-    output_path: &PathBuf,
-    model_path: &PathBuf,
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+    model_path: &std::path::Path,
 ) -> Result<()> {
     let session = create_onnx_session(model_path)?;
     let original_image = image::open(input_path).context("Failed to open image")?;
@@ -127,146 +130,197 @@ fn run_bg_removal_inference(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn bg_one(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    model_path: &std::path::Path,
+    output_dir: &Option<String>,
+    limiter: ImageJobLimiter,
+) -> ImageFileResult {
+    let record: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT filepath, size FROM images WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+    let Some((filepath, source_size)) = record else {
+        return ImageFileResult::failed(id, "Image not found".to_string());
+    };
+
+    let orig_path = PathBuf::from(&filepath);
+    if !orig_path.exists() {
+        return ImageFileResult::failed(id, "Source file is missing".to_string());
+    }
+
+    let file_stem = orig_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    // Always output PNG for background removal.
+    let new_filename = format!("{}_no_bg.png", file_stem);
+    let final_filepath = match output_dir {
+        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&new_filename),
+        _ => orig_path.with_file_name(&new_filename),
+    };
+    // `.tmp.png` so the image crate can still detect the format.
+    let temp_filename = format!("{}.tmp.png", file_stem);
+    let temp_filepath = match output_dir {
+        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&temp_filename),
+        _ => orig_path.with_file_name(&temp_filename),
+    };
+
+
+    emit_progress(app, "bg-removal-progress", id, 5, "encoding", "running", "Processing...");
+
+    let (_permit, queue_position) = limiter.acquire().await;
+    if queue_position > 0 {
+        emit_progress(
+            app,
+            "bg-removal-progress",
+            id,
+            0,
+            "queued",
+            "running",
+            &format!("Queued (position {})", queue_position + 1),
+        );
+    }
+
+    let token = image_pipeline::token_for(app, id);
+    if image_pipeline::is_cancelled(&token) {
+        let _ = fs::remove_file(&temp_filepath);
+        emit_progress(app, "bg-removal-progress", id, 0, "cancelled", "cancelled", "Cancelled");
+        return ImageFileResult::cancelled(id, source_size);
+    }
+
+    let orig_for_blocking = orig_path.clone();
+    let temp_for_blocking = temp_filepath.clone();
+    let model_for_blocking = model_path.to_path_buf();
+    let removal = tauri::async_runtime::spawn_blocking(move || {
+        run_bg_removal_inference(&orig_for_blocking, &temp_for_blocking, &model_for_blocking)
+    })
+    .await;
+
+    match removal {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = fs::remove_file(&temp_filepath);
+            let message = format!("Background removal failed: {}", e);
+            emit_progress(app, "bg-removal-progress", id, 0, "error", "failed", "Failed");
+            return ImageFileResult::failed(id, message);
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&temp_filepath);
+            let message = format!("Task failed: {}", e);
+            emit_progress(app, "bg-removal-progress", id, 0, "error", "failed", "Failed");
+            return ImageFileResult::failed(id, message);
+        }
+    }
+
+    if final_filepath.exists() {
+        let _ = fs::remove_file(&final_filepath);
+    }
+    if let Err(e) = fs::rename(&temp_filepath, &final_filepath) {
+        let _ = fs::remove_file(&temp_filepath);
+        let message = format!("Failed to finalize output: {}", e);
+        emit_progress(app, "bg-removal-progress", id, 0, "error", "failed", "Failed");
+        return ImageFileResult::failed(id, message);
+    }
+
+    let size = fs::metadata(&final_filepath).map(|m| m.len() as i64).ok();
+    let fp = dunce::canonicalize(&final_filepath)
+        .unwrap_or_else(|_| final_filepath.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let insert = sqlx::query(
+        "INSERT OR REPLACE INTO bg_removed_images \
+         (original_id, filepath, size, model_used, status, completed_at) \
+         VALUES (?, ?, ?, ?, 'done', datetime('now'))",
+    )
+    .bind(id)
+    .bind(&fp)
+    .bind(size)
+    .bind(MODEL_NAME)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = insert {
+        let message = format!("Failed to save result: {}", e);
+        emit_progress(app, "bg-removal-progress", id, 0, "error", "failed", "Failed");
+        return ImageFileResult::failed(id, message);
+    }
+
+    emit_progress(app, "bg-removal-progress", id, 100, "done", "done", "Done");
+    let _ = app.emit("images-updated", ());
+
+    ImageFileResult {
+        id,
+        status: "done".to_string(),
+        message: None,
+        output_path: Some(fp),
+        size,
+        source_size,
+    }
+}
+
+async fn remove_background_inner(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    ids: Vec<i64>,
+) -> Result<ImageBatchResult, String> {
+    let (model_path, _model_size) = check_model_downloaded(app)?;
+
+    let output_dir_setting: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'output'")
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+
+    let limiter = app.state::<ImageJobLimiter>().inner().clone();
+    let ids_cleanup = ids.clone();
+    image_pipeline::register_tokens(app, &ids);
+
+    let results: Vec<ImageFileResult> = stream::iter(ids)
+        .map(|id| {
+            let app = app.clone();
+            let pool = pool.clone();
+            let output_dir_setting = output_dir_setting.clone();
+            let limiter = limiter.clone();
+            let model_path = model_path.clone();
+            async move {
+                bg_one(&app, &pool, id, &model_path, &output_dir_setting, limiter).await
+            }
+        })
+        .buffer_unordered(num_cpus::get().max(2))
+        .collect()
+        .await;
+
+    image_pipeline::clear_tokens(app, &ids_cleanup);
+    Ok(build_batch(results))
+}
+
 #[tauri::command]
 pub async fn remove_background_by_ids(
     app: AppHandle,
     state: State<'_, DbState>,
     ids: Vec<i64>,
 ) -> Result<usize, String> {
-    let pool = state.0.clone();
-    
-    // Check if model is downloaded
-    let (model_path, _model_size) = check_model_downloaded(&app)?;
-    
-    let output_dir_setting: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'output'")
-        .fetch_optional(&pool)
-        .await
-        .unwrap_or(None);
+    let result = remove_background_inner(&app, &state.0, ids).await?;
+    Ok(result.processed)
+}
 
-    let concurrency_limit = num_cpus::get().max(2);
-
-    let results: Vec<bool> = stream::iter(ids.into_iter())
-        .map(|id| {
-            let app_clone = app.clone();
-            let pool_clone = pool.clone();
-            let output_dir_clone = output_dir_setting.clone();
-            let model_path_clone = model_path.clone();
-            
-            async move {
-                let image_record: Option<(String,)> = sqlx::query_as("SELECT filepath FROM images WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&pool_clone)
-                    .await
-                    .ok()
-                    .flatten();
-
-                if let Some((filepath,)) = image_record {
-                    let _ = app_clone.emit("bg-removal-progress", models::DownloadProgress {
-                        id,
-                        progress: 10,
-                        message: "Reading...".to_string(),
-                    });
-
-                    let orig_path = PathBuf::from(&filepath);
-                    if !orig_path.exists() {
-                        return false;
-                    }
-
-                    let file_stem = orig_path.file_stem().unwrap_or_default().to_string_lossy();
-                    // Always output PNG for background removal
-                    let new_filename = format!("{}_no_bg.png", file_stem);
-                    
-                    let final_filepath = match &output_dir_clone {
-                        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&new_filename),
-                        _ => orig_path.with_file_name(&new_filename),
-                    };
-
-                    // Use .tmp.png extension so image crate can detect format properly
-                    let temp_filename = format!("{}.tmp.png", file_stem);
-                    let temp_filepath = match &output_dir_clone {
-                        Some(dir) if PathBuf::from(dir).exists() => PathBuf::from(dir).join(&temp_filename),
-                        _ => orig_path.with_file_name(&temp_filename),
-                    };
-
-                    let _ = app_clone.emit("bg-removal-progress", models::DownloadProgress {
-                        id,
-                        progress: 20,
-                        message: "Processing...".to_string(),
-                    });
-
-                    let temp_filepath_clone = temp_filepath.clone();
-                    let removal_result = tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-                        run_bg_removal_inference(
-                            &orig_path,
-                            &temp_filepath_clone,
-                            &model_path_clone,
-                        )
-                    }).await;
-
-                    match removal_result {
-                        Ok(Ok(_)) => {
-                            // Delete existing file if it exists (Windows requires this before rename)
-                            if final_filepath.exists() {
-                                if let Err(e) = fs::remove_file(&final_filepath) {
-                                    log::error!("Failed to remove existing file {}: {}", final_filepath.display(), e);
-                                }
-                            }
-                            
-                            if let Err(e) = fs::rename(&temp_filepath, &final_filepath) {
-                                log::error!("Failed to rename temp file from {} to {}: {}", temp_filepath.display(), final_filepath.display(), e);
-                                let _ = fs::remove_file(&temp_filepath);
-                                return false;
-                            }
-
-                            let size = fs::metadata(&final_filepath).map(|m| m.len() as i64).ok();
-                            let fp = dunce::canonicalize(&final_filepath).unwrap_or(final_filepath).to_string_lossy().to_string();
-                            
-                            let insert_result = sqlx::query(
-                                "INSERT OR REPLACE INTO bg_removed_images (original_id, filepath, size, model_used) VALUES (?, ?, ?, ?)"
-                            )
-                            .bind(id)
-                            .bind(fp)
-                            .bind(size)
-                            .bind(MODEL_NAME)
-                            .execute(&pool_clone)
-                            .await;
-
-                            if insert_result.is_ok() {
-                                let _ = app_clone.emit("bg-removal-progress", models::DownloadProgress {
-                                    id,
-                                    progress: 100,
-                                    message: "Done".to_string(),
-                                });
-                                let _ = app_clone.emit("images-updated", ());
-                                return true;
-                            }
-                        },
-                        Ok(Err(e)) => {
-                            log::error!("Background removal error for ID {}: {}", id, e);
-                            let _ = fs::remove_file(&temp_filepath);
-                        },
-                        Err(e) => {
-                            log::error!("Tokio spawn error for ID {}: {}", id, e);
-                            let _ = fs::remove_file(&temp_filepath);
-                        }
-                    }
-                    
-                    let _ = app_clone.emit("bg-removal-progress", models::DownloadProgress {
-                        id,
-                        progress: 0,
-                        message: "Failed".to_string(),
-                    });
-                }
-                false
-            }
-        })
-        .buffer_unordered(concurrency_limit)
-        .collect()
-        .await;
-
-    let processed_count = results.into_iter().filter(|&success| success).count();
-
-    Ok(processed_count)
+#[tauri::command]
+pub async fn remove_background_by_ids_v2(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    ids: Vec<i64>,
+) -> Result<ImageBatchResult, String> {
+    remove_background_inner(&app, &state.0, ids).await
 }
 
 #[tauri::command]

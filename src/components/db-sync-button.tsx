@@ -2,7 +2,7 @@ import { useCallback } from 'react'
 import { useRouter } from '@tanstack/react-router'
 import { DatabaseZap } from 'lucide-react'
 import { useValue, useSetValueCallback } from '@/schema/tinybase-schema'
-import { syncDatabase } from '@/lib/tauri'
+import { orphanScan, orphanCleanup } from '@/lib/tauri'
 import { addNotification } from '@/lib/notifications'
 import { error as logError } from '@/lib/logger'
 import { Button } from '@/components/ui/button'
@@ -16,17 +16,27 @@ export function DbSyncButton() {
 
   const handleSyncDb = useCallback(async () => {
     try {
-      const deletedCount = await syncDatabase()
-      if (deletedCount > 0) {
-        await addNotification({
-          message: `Cleaned up ${deletedCount} orphaned records.`,
-          status: 'success',
-        })
-      } else {
+      // Preview first, then confirm, then run the shared cleanup routine.
+      const preview = await orphanScan()
+      const total = preview.orphaned_rows.length + preview.orphaned_files.length
+      if (total === 0) {
         await addNotification({ message: 'Database is in sync.', status: 'info' })
+        clearDbNeedsSync()
+        return
       }
+
+      const confirmed = window.confirm(
+        `Remove ${preview.orphaned_rows.length} orphaned record(s) and ` +
+          `${preview.orphaned_files.length} orphaned file(s)?`
+      )
+      if (!confirmed) return
+
+      const result = await orphanCleanup()
+      await addNotification({
+        message: `Cleaned ${result.deleted_rows} record(s) and ${result.deleted_files} file(s).`,
+        status: 'success',
+      })
       clearDbNeedsSync()
-      // Invalidate router cache to refresh all route loaders
       await router.invalidate()
     } catch (err) {
       logError(`Failed to sync database: ${err}`)

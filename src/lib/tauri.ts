@@ -213,6 +213,68 @@ export async function getAllBgRemovedImages(): Promise<Image[]> {
   return invoke<Image[]>('get_all_bg_removed_images')
 }
 
+// --- Image batch results (v2: parity with the video pipeline) ---
+
+export interface ImageFileResult {
+  id: number
+  status: string
+  message: string | null
+  output_path: string | null
+  size: number | null
+  source_size: number | null
+}
+
+export interface ImageFileError {
+  id: number
+  message: string
+}
+
+export interface ImageBatchResult {
+  processed: number
+  failed: number
+  cancelled: number
+  errors: ImageFileError[]
+  results: ImageFileResult[]
+}
+
+export async function compressImagesByIdsV2(
+  ids: number[],
+  quality: number
+): Promise<ImageBatchResult> {
+  return invoke<ImageBatchResult>('compress_images_by_ids_v2', { ids, quality })
+}
+
+export async function convertImagesByIdsV2(
+  ids: number[],
+  format: ImageFormat
+): Promise<ImageBatchResult> {
+  return invoke<ImageBatchResult>('convert_images_by_ids_v2', { ids, format })
+}
+
+export async function upscaleImagesByIdsV2(
+  ids: number[],
+  scale: number,
+  model: string
+): Promise<ImageBatchResult> {
+  return invoke<ImageBatchResult>('upscale_images_by_ids_v2', { ids, scale, model })
+}
+
+export async function removeBackgroundByIdsV2(ids: number[]): Promise<ImageBatchResult> {
+  return invoke<ImageBatchResult>('remove_background_by_ids_v2', { ids })
+}
+
+export async function cancelImageJobs(ids: number[]): Promise<void> {
+  return invoke<void>('cancel_image_jobs', { ids })
+}
+
+export async function getImageJobLimit(): Promise<number> {
+  return invoke<number>('get_image_job_limit')
+}
+
+export async function setImageJobLimit(limit: number): Promise<void> {
+  return invoke<void>('set_image_job_limit', { limit })
+}
+
 // Video Processing API
 export interface ConvertedVideo {
   filepath: string
@@ -294,6 +356,56 @@ export async function deleteVideosByIds(ids: number[]): Promise<void> {
   return invoke<void>('delete_videos_by_ids', { ids })
 }
 
+export interface SkippedFile {
+  path: string
+  reason: string
+}
+
+export interface DeleteReport {
+  rows_deleted: number
+  files_deleted: number
+  bytes_freed: number
+  skipped: SkippedFile[]
+}
+
+export type DeleteAction = 'library' | 'outputs' | 'all'
+
+export async function deleteItems(
+  kind: 'image' | 'video',
+  ids: number[],
+  deleteFiles: boolean
+): Promise<DeleteReport> {
+  return invoke<DeleteReport>('delete_items', { kind, ids, deleteFiles })
+}
+
+/** Delete generated outputs for the items, keeping their originals. */
+export async function deleteOutputs(
+  kind: 'image' | 'video',
+  ids: number[],
+  outputKind?: string
+): Promise<DeleteReport> {
+  return invoke<DeleteReport>('delete_outputs', { kind, ids, outputKind: outputKind ?? null })
+}
+
+/** Delete a single generated output variant (by its table kind + row id). */
+export async function deleteOutput(outputKind: string, id: number): Promise<DeleteReport> {
+  return invoke<DeleteReport>('delete_output', { outputKind, id })
+}
+
+export interface CompressedVariant {
+  id: number
+  filepath: string
+  size: number | null
+  label: string
+}
+
+export async function getCompressedVariants(
+  kind: 'image' | 'video',
+  id: number
+): Promise<CompressedVariant[]> {
+  return invoke<CompressedVariant[]>('get_compressed_variants', { kind, id })
+}
+
 export interface VideoBgRemovalResult {
   processed: number
   failed: number
@@ -320,6 +432,14 @@ export async function cancelVideoBgRemoval(ids: number[]): Promise<void> {
   return invoke<void>('cancel_video_bg_removal', { ids })
 }
 
+export async function cancelVideoCompression(ids: number[]): Promise<void> {
+  return invoke<void>('cancel_video_compression', { ids })
+}
+
+export async function cancelVideoConversion(ids: number[]): Promise<void> {
+  return invoke<void>('cancel_video_conversion', { ids })
+}
+
 export async function getAllCompressedVideos(): Promise<Video[]> {
   return invoke<Video[]>('get_all_compressed_videos')
 }
@@ -340,6 +460,156 @@ export async function compressVideosByIds(
   preset: string
 ): Promise<number> {
   return invoke<number>('compress_videos_by_ids', { ids, quality, preset })
+}
+
+export type CompressionMode = 'quality' | 'target_size'
+export type CompressionCodec = 'auto' | 'h264' | 'hevc' | 'av1'
+
+export interface CompressionRequest {
+  mode: CompressionMode
+  quality?: number
+  preset?: string
+  codec?: CompressionCodec
+  target_bytes?: number
+  target_percent?: number
+  drop_audio?: boolean
+  max_dimension?: number
+}
+
+export interface CompressionFileResult {
+  id: number
+  status: string
+  message: string | null
+  planned_bitrate_kbps: number | null
+  achieved_size: number | null
+  source_size: number | null
+  output_path: string | null
+  kept_original: boolean
+}
+
+export interface CompressionFileError {
+  id: number
+  message: string
+}
+
+export interface CompressionBatchResult {
+  processed: number
+  failed: number
+  cancelled: number
+  errors: CompressionFileError[]
+  results: CompressionFileResult[]
+}
+
+export async function compressVideosByIdsV2(
+  ids: number[],
+  request: CompressionRequest
+): Promise<CompressionBatchResult> {
+  return invoke<CompressionBatchResult>('compress_videos_by_ids_v2', { ids, request })
+}
+
+export interface EncoderCapabilities {
+  h264: boolean
+  hevc: boolean
+  av1: boolean
+  hardware: string[]
+}
+
+export async function getEncoderCapabilities(): Promise<EncoderCapabilities> {
+  return invoke<EncoderCapabilities>('get_encoder_capabilities')
+}
+
+export interface OrphanRow {
+  table: string
+  id: number
+  filepath: string
+}
+
+export interface OrphanFile {
+  path: string
+  bytes: number
+}
+
+export interface OrphanScan {
+  orphaned_rows: OrphanRow[]
+  orphaned_files: OrphanFile[]
+  deleted_rows: number
+  deleted_files: number
+  bytes_reclaimed: number
+  statements: number
+  dry_run: boolean
+  skipped_files: string[]
+}
+
+export interface DbTableInfo {
+  name: string
+  rows: number
+}
+
+export interface DbOverview {
+  path: string
+  schema_version: number
+  tables: DbTableInfo[]
+}
+
+export interface DbTableRows {
+  columns: string[]
+  rows: (string | number | null)[][]
+  total: number
+}
+
+export async function dbOverview(): Promise<DbOverview> {
+  return invoke<DbOverview>('db_overview')
+}
+
+export async function dbTableRows(
+  table: string,
+  limit: number,
+  offset: number
+): Promise<DbTableRows> {
+  return invoke<DbTableRows>('db_table_rows', { table, limit, offset })
+}
+
+export interface AppLog {
+  path: string
+  lines: string[]
+}
+
+/** Tail of the app log file (same text as the terminal). */
+export async function readAppLog(maxLines: number, allSessions = false): Promise<AppLog> {
+  return invoke<AppLog>('read_app_log', { maxLines, allSessions })
+}
+
+export async function orphanScan(): Promise<OrphanScan> {
+  return invoke<OrphanScan>('orphan_scan')
+}
+
+export async function orphanCleanup(): Promise<OrphanScan> {
+  return invoke<OrphanScan>('orphan_cleanup')
+}
+
+export async function getVideoJobLimit(): Promise<number> {
+  return invoke<number>('get_video_job_limit')
+}
+
+export async function setVideoJobLimit(limit: number): Promise<void> {
+  return invoke<void>('set_video_job_limit', { limit })
+}
+
+export interface ConversionOptions {
+  drop_audio?: boolean
+  max_dimension?: number
+}
+
+export async function convertVideosByIdsV2(
+  ids: number[],
+  format: VideoFormat,
+  opts?: ConversionOptions
+): Promise<CompressionBatchResult> {
+  return invoke<CompressionBatchResult>('convert_videos_by_ids_v2', {
+    ids,
+    format,
+    opts: opts ?? null,
+  })
 }
 
 // Convert Format API

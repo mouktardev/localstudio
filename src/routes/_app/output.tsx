@@ -1,4 +1,4 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState, useEffect, useMemo, useCallback, memo } from 'react'
 import {
   getAllCompressedImages,
@@ -122,7 +122,13 @@ function parseUpscaledVersions(
 }
 
 // Memoized grid item to prevent unnecessary re-renders
-const OutputGridItem = memo(function OutputGridItem({ image }: { image: OutputImage }) {
+const OutputGridItem = memo(function OutputGridItem({
+  image,
+  onOpenInApp,
+}: {
+  image: OutputImage
+  onOpenInApp: (image: OutputImage) => void
+}) {
   const [imageError, setImageError] = useState(false)
 
   const isCompressed = image.resultType === 'compressed'
@@ -155,6 +161,7 @@ const OutputGridItem = memo(function OutputGridItem({ image }: { image: OutputIm
         <div
           role="button"
           tabIndex={0}
+          onDoubleClick={() => onOpenInApp(image)}
           className="group bg-card hover:border-foreground/50 relative flex flex-col overflow-hidden border transition-all"
         >
           <div
@@ -259,6 +266,10 @@ const OutputGridItem = memo(function OutputGridItem({ image }: { image: OutputIm
       </ContextMenuTrigger>
 
       <ContextMenuContent>
+        <ContextMenuItem onClick={() => onOpenInApp(image)}>
+          <Maximize2 className="mr-2 h-4 w-4" />
+          Open in app
+        </ContextMenuItem>
         <ContextMenuItem onClick={handleOpen}>
           <FileImage className="mr-2 h-4 w-4" />
           Open{' '}
@@ -283,6 +294,27 @@ const OutputGridItem = memo(function OutputGridItem({ image }: { image: OutputIm
 
 function OutputPage() {
   const loaderData = Route.useLoaderData()
+  const navigate = useNavigate()
+
+  // Generated files open in the parent item's detail viewer at that variant.
+  const handleOpenInApp = useCallback(
+    (image: OutputImage) => {
+      if (image.isVideo) {
+        navigate({
+          to: '/videos/$videoId',
+          params: { videoId: String(image.id) },
+          search: { view: image.displayFilepath },
+        })
+      } else {
+        navigate({
+          to: '/$imageId',
+          params: { imageId: String(image.id) },
+          search: { view: image.displayFilepath },
+        })
+      }
+    },
+    [navigate]
+  )
 
   // Initialize filter state from loader data (fetched via beforeLoad)
   const [outputType, setOutputType] = useState<OutputType>(
@@ -653,6 +685,7 @@ function OutputPage() {
               <OutputGridItem
                 key={`${image.id}-${image.resultType}-${image.displayFilepath}`}
                 image={image}
+                onOpenInApp={handleOpenInApp}
               />
             ))}
           </div>

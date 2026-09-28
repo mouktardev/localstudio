@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
@@ -16,12 +16,20 @@ import type { Video } from '@/lib/tauri'
 import { SearchBar } from '@/components/search-bar'
 import { SortDropdown } from '@/components/sort-dropdown'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import type { DeleteAction } from '@/lib/tauri'
 
 interface VideoToolsProps {
   videos: Video[]
   selectedIds: number[]
   onSelectionChange: (ids: number[]) => void
-  onDeleteClick: () => void
+  onDeleteClick: (action: DeleteAction) => void
   onImportClick: () => void
   onCompressClick?: () => void
   onConvertClick?: () => void
@@ -55,6 +63,14 @@ export function VideoTools({
   onResetFilters,
 }: VideoToolsProps) {
   const [openDeleteDialog, setOpenDeleteDialog] = useState(false)
+  const [deleteAction, setDeleteAction] = useState<DeleteAction>('library')
+
+  useEffect(() => {
+    if (selectedIds.length === 0) {
+      setOpenDeleteDialog(false)
+      setDeleteAction('library')
+    }
+  }, [selectedIds.length])
 
   const handleSelectAll = () => {
     if (selectedIds.length === videos.length) {
@@ -65,7 +81,7 @@ export function VideoTools({
   }
 
   const handleDeleteConfirm = () => {
-    onDeleteClick()
+    onDeleteClick(deleteAction)
     setOpenDeleteDialog(false)
   }
 
@@ -115,58 +131,75 @@ export function VideoTools({
       )}
 
       {selectedIds.length > 0 && (
-        <>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="destructive"
-                onClick={() => setOpenDeleteDialog(true)}
-                size="icon"
-                className="h-8 w-8"
-              >
-                <Trash2 className="size-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Remove</TooltipContent>
-          </Tooltip>
-
-          <Dialog open={openDeleteDialog} onOpenChange={setOpenDeleteDialog}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Remove selected videos?</DialogTitle>
-                <DialogDescription>
-                  You are about to remove {selectedIds.length} video(s) from the app and database.
-                  The original file on your device will not be affected. This action cannot be
-                  undone.
-                </DialogDescription>
-              </DialogHeader>
-              {selectedVideos.length > 0 && (
-                <div className="bg-muted max-h-40 overflow-y-auto rounded border p-2">
-                  {selectedVideos.map((v) => (
-                    <div
-                      key={v.id}
-                      className="flex items-center justify-between border-b py-1 last:border-b-0"
-                    >
-                      <span className="max-w-50 truncate">{v.filename}</span>
-                      <span className="text-muted-foreground text-xs">
-                        {v.size ? formatBytes(v.size) : 'Unknown'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setOpenDeleteDialog(false)}>
-                  Cancel
-                </Button>
-                <Button variant="destructive" onClick={handleDeleteConfirm}>
-                  Remove
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        </>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="destructive"
+              onClick={() => setOpenDeleteDialog(true)}
+              size="icon"
+              className="h-8 w-8"
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Remove</TooltipContent>
+        </Tooltip>
       )}
+
+      {/* Mounted unconditionally so it cannot unmount mid-interaction when the
+          selection empties out from under it. */}
+      <Dialog open={openDeleteDialog} onOpenChange={setOpenDeleteDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove selected videos?</DialogTitle>
+            <DialogDescription>
+              You are about to remove {selectedIds.length} video(s) from the app and database. The
+              original file on your device will not be affected. This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          {selectedVideos.length > 0 && (
+            <div className="bg-muted max-h-40 overflow-y-auto rounded border p-2">
+              {selectedVideos.map((v) => (
+                <div
+                  key={v.id}
+                  className="flex items-center justify-between border-b py-1 last:border-b-0"
+                >
+                  <span className="max-w-50 truncate">{v.filename}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {v.size ? formatBytes(v.size) : 'Unknown'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Action</Label>
+            <Select value={deleteAction} onValueChange={(v) => setDeleteAction(v as DeleteAction)}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="library">Remove from library (keep files)</SelectItem>
+                <SelectItem value="outputs">Delete generated outputs (keep originals)</SelectItem>
+                <SelectItem value="all">Delete originals + outputs from disk</SelectItem>
+              </SelectContent>
+            </Select>
+            {deleteAction === 'all' && (
+              <p className="text-destructive text-xs">
+                This permanently deletes files from disk. This cannot be undone.
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpenDeleteDialog(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteConfirm}>
+              Remove
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <div className="ml-auto flex items-center gap-2">
         <Checkbox

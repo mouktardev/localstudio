@@ -4,8 +4,8 @@ import {
   info as tauriInfo,
   debug as tauriDebug,
   trace as tauriTrace,
-  attachLogger,
 } from '@tauri-apps/plugin-log'
+import { readAppLog } from '@/lib/tauri'
 import type { AppStore } from '@/schema/tinybase-schema'
 
 function fmt(message: unknown, ...args: unknown[]): string {
@@ -16,7 +16,11 @@ function fmt(message: unknown, ...args: unknown[]): string {
   return parts.join(' ')
 }
 
-/** Call once at app startup to forward console.* to tauri-plugin-log */
+/**
+ * Forward console.* to tauri-plugin-log so frontend logs land in the terminal
+ * and the app log file. `console.log` maps to Info (not Debug) so it is actually
+ * captured by the default Info filter.
+ */
 export function setupLogger() {
   const originalLog = console.log
   const originalDebug = console.debug
@@ -37,62 +41,40 @@ export function setupLogger() {
     originalInfo(message, ...args)
   }
   console.log = (message: unknown, ...args: unknown[]) => {
-    tauriDebug(fmt(message, ...args))
+    tauriInfo(fmt(message, ...args))
     originalLog(message, ...args)
   }
   console.debug = (message: unknown, ...args: unknown[]) => {
-    tauriTrace(fmt(message, ...args))
+    tauriDebug(fmt(message, ...args))
     originalDebug(message, ...args)
   }
 }
 
-let idCounter = 0
-const MAX_LOGS = 200
+let lastSeenLine: string | null = null
 
-function isFileNotFoundError(message: string): boolean {
-  const lower = message.toLowerCase()
-  return (
-    lower.includes('os error 2') ||
-    lower.includes('the system cannot find the file specified') ||
-    lower.includes('no such file or directory') ||
-    lower.includes('file not found') ||
-    lower.includes('file does not exist') ||
-    lower.includes('path does not exist') ||
-    lower.includes('could not find')
-  )
-}
-
-export async function attachGlobalLogListener(store: AppStore) {
-  return attachLogger((record) => {
-    const id = (++idCounter).toString()
-    store.setRow('logs', id, {
-      level: record.level,
-      message: record.message,
-      timestamp: Date.now(),
-    })
-
-    if (!store.getValue('logsOpen')) {
-      store.setValue('logsUnread', true)
+/**
+ * Polls the tail of the app log so the sidebar can show an unread dot when new
+ * lines arrive while the log panel is closed. Returns a stop function.
+ */
+export function startLogWatcher(store: AppStore): () => void {
+  const tick = async () => {
+    try {
+      const { lines } = await readAppLog(1, false)
+      const latest = lines.length > 0 ? lines[lines.length - 1] : null
+      if (latest && latest !== lastSeenLine) {
+        lastSeenLine = latest
+        if (!store.getValue('logsOpen')) {
+          store.setValue('logsUnread', true)
+        }
+      }
+    } catch {
+      // Logging must never throw.
     }
+  }
 
-    // Check if this is a file not found error - mark DB as needing sync
-    // Note: We ignore [tauri::protocol::asset] errors as these are expected
-    // when viewing pages with stale data. DB health is checked proactively
-    // via checkDbHealth() on navigation instead.
-    if (
-      record.level >= 4 &&
-      isFileNotFoundError(record.message) &&
-      !record.message.includes('[tauri::protocol::asset]')
-    ) {
-      store.setValue('dbNeedsSync', true)
-    }
-
-    // Keep memory bounded
-    const logIds = store.getRowIds('logs')
-    if (logIds.length > MAX_LOGS) {
-      store.delRow('logs', logIds[0])
-    }
-  })
+  void tick()
+  const id = window.setInterval(tick, 3000)
+  return () => window.clearInterval(id)
 }
 
 export {
@@ -101,5 +83,4 @@ export {
   tauriInfo as info,
   tauriDebug as debug,
   tauriTrace as trace,
-  attachLogger,
 }

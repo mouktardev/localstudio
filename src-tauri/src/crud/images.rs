@@ -38,9 +38,16 @@ pub struct Image {
 
 #[derive(Debug, Deserialize)]
 pub struct ImageQueryParams {
+    #[serde(default)]
     pub search: Option<String>,
-    pub sort_field: String,  // 'name', 'size', 'date'
-    pub sort_order: String,  // 'asc', 'desc'
+    #[serde(default)]
+    pub sort_field: String, // 'name', 'size', 'date'
+    #[serde(default)]
+    pub sort_order: String, // 'asc', 'desc'
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,33 +81,40 @@ pub async fn get_all_images(
     params: Option<ImageQueryParams>,
 ) -> Result<Vec<Image>, String> {
     let pool = &state.0;
-    
+
     let order_clause = if let Some(ref p) = params {
         let sort_field = match p.sort_field.as_str() {
             "name" => "i.filename",
             "size" => "i.size",
             _ => "i.id",
         };
-        let sort_order = if p.sort_order == "asc" { "ASC" } else { "DESC" };
-        format!("ORDER BY {} {}", sort_field, sort_order)
+        format!(
+            "ORDER BY {} {}",
+            sort_field,
+            crate::crud::query::sort_direction(Some(p.sort_order.as_str()))
+        )
     } else {
         "ORDER BY i.id DESC".to_string()
     };
-    
-    let search_clause = if let Some(ref p) = params {
-        if let Some(ref search) = p.search {
-            if !search.is_empty() {
-                format!("WHERE LOWER(i.filename) LIKE LOWER('%{}%')", search.replace("'", "''"))
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        }
+
+    let search = params
+        .as_ref()
+        .and_then(|p| p.search.clone())
+        .unwrap_or_default();
+    let (search_clause, search_bind) = if search.trim().is_empty() {
+        (String::new(), None)
     } else {
-        String::new()
+        (
+            "WHERE LOWER(i.filename) LIKE ? ESCAPE '\\'".to_string(),
+            Some(crate::crud::query::like_contains(&search)),
+        )
     };
-    
+
+    let (limit_clause, limit_bind) = params
+        .as_ref()
+        .map(|p| crate::crud::query::limit_offset(p.limit, p.offset))
+        .unwrap_or((String::new(), None));
+
     let query = format!(
         "SELECT 
             i.id, i.filename, i.filepath, i.mimetype, i.size, i.width, i.height,
@@ -120,34 +134,42 @@ pub async fn get_all_images(
          LEFT JOIN bg_removed_images bi ON bi.original_id = i.id
          {}
          GROUP BY i.id
-         {}",
-        search_clause,
-        order_clause
+         {}{}",
+        search_clause, order_clause, limit_clause
     );
-    
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<i64>, String, Option<String>, Option<i64>)>(&query)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    let mut q = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<i64>, String, Option<String>, Option<i64>)>(&query);
+    if let Some(bind) = search_bind {
+        q = q.bind(bind);
+    }
+    if let Some((limit, offset)) = limit_bind {
+        q = q.bind(limit).bind(offset);
+    }
+    let rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
 
     let conv_rows = sqlx::query_as::<_, (i64, String, Option<i64>, String)>(
-        "SELECT original_id, filepath, size, format FROM converted_images ORDER BY id DESC"
+        "SELECT original_id, filepath, size, format FROM converted_images ORDER BY id DESC",
     )
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut conv_map: std::collections::HashMap<i64, Vec<ConvertedImage>> = std::collections::HashMap::new();
+    let mut conv_map: std::collections::HashMap<i64, Vec<ConvertedImage>> =
+        std::collections::HashMap::new();
     for (orig_id, fp, sz, fmt) in conv_rows {
-        conv_map.entry(orig_id).or_default().push(ConvertedImage { filepath: fp, size: sz, format: fmt });
+        conv_map.entry(orig_id).or_default().push(ConvertedImage {
+            filepath: fp,
+            size: sz,
+            format: fmt,
+        });
     }
 
     let images: Vec<Image> = rows
         .into_iter()
         .map(|(id, filename, filepath, mimetype, size, width, height, compressed_filepath, compressed_size, upscaled_versions, bg_removed_filepath, bg_removed_size)| {
             let converted_images = conv_map.remove(&id).unwrap_or_default();
-            Image { 
-                id, filename, filepath, mimetype, size, width, height, 
+            Image {
+                id, filename, filepath, mimetype, size, width, height,
                 compressed_filepath, compressed_size,
                 upscaled_versions,
                 bg_removed_filepath,
@@ -336,6 +358,7 @@ pub async fn import_images_bulk(
         size: i64,
         width: i64,
         height: i64,
+        sha256: Option<String>,
     }
 
     let mut rows: Vec<ImageRow> = Vec::with_capacity(filepaths.len());
@@ -397,15 +420,37 @@ pub async fn import_images_bulk(
             .unwrap_or(filepath)
             .to_string();
 
-        rows.push(ImageRow { filename, filepath: fp, mimetype, size, width, height });
+        let sha256 = crate::crud::hashing::hash_file(&canonical_path)
+            .ok()
+            .filter(|hash| !hash.is_empty());
+
+        rows.push(ImageRow { filename, filepath: fp, mimetype, size, width, height, sha256 });
     }
 
     // Bulk insert in a single transaction
     let mut tx = state.0.begin().await.map_err(|e| e.to_string())?;
 
+    let mut seen_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in &rows {
+        // Content duplicate: same bytes under a different name.
+        if let Some(hash) = row.sha256.as_ref() {
+            if !seen_hashes.insert(hash.clone()) {
+                duplicates += 1;
+                continue;
+            }
+            let existing: Option<(i64,)> = sqlx::query_as("SELECT id FROM images WHERE sha256 = ?")
+                .bind(hash)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            if existing.is_some() {
+                duplicates += 1;
+                continue;
+            }
+        }
+
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO images (filename, filepath, mimetype, size, width, height) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO images (filename, filepath, mimetype, size, width, height, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))"
         )
         .bind(&row.filename)
         .bind(&row.filepath)
@@ -413,6 +458,7 @@ pub async fn import_images_bulk(
         .bind(row.size)
         .bind(row.width)
         .bind(row.height)
+        .bind(&row.sha256)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -431,31 +477,15 @@ pub async fn import_images_bulk(
 
 #[tauri::command]
 pub async fn delete_image(id: i64, state: State<'_, DbState>) -> Result<(), String> {
-    sqlx::query("DELETE FROM compressed_images WHERE original_id = ?")
-        .bind(id)
-        .execute(&state.0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    sqlx::query("DELETE FROM upscaled_images WHERE original_id = ?")
-        .bind(id)
-        .execute(&state.0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    sqlx::query("DELETE FROM bg_removed_images WHERE original_id = ?")
-        .bind(id)
-        .execute(&state.0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    sqlx::query("DELETE FROM images WHERE id = ?")
-        .bind(id)
-        .execute(&state.0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    // Single delete path; library files are kept (delete_files = false).
+    crate::crud::lifecycle::delete_items_impl(
+        &state.0,
+        crate::crud::lifecycle::ItemKind::Image,
+        &[id],
+        false,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -464,41 +494,15 @@ pub async fn delete_images_by_ids(ids: Vec<i64>, state: State<'_, DbState>) -> R
         return Ok(());
     }
 
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    
-    // Also explicitly delete compressed images
-    let ci_query = format!("DELETE FROM compressed_images WHERE original_id IN ({})", placeholders);
-    let mut ci_q = sqlx::query(&ci_query);
-    for id in &ids {
-        ci_q = ci_q.bind(id);
-    }
-    ci_q.execute(&state.0).await.map_err(|e| e.to_string())?;
-
-    // Also explicitly delete upscaled images
-    let ui_query = format!("DELETE FROM upscaled_images WHERE original_id IN ({})", placeholders);
-    let mut ui_q = sqlx::query(&ui_query);
-    for id in &ids {
-        ui_q = ui_q.bind(id);
-    }
-    ui_q.execute(&state.0).await.map_err(|e| e.to_string())?;
-
-    // Also explicitly delete background removed images
-    let bi_query = format!("DELETE FROM bg_removed_images WHERE original_id IN ({})", placeholders);
-    let mut bi_q = sqlx::query(&bi_query);
-    for id in &ids {
-        bi_q = bi_q.bind(id);
-    }
-    bi_q.execute(&state.0).await.map_err(|e| e.to_string())?;
-
-    let query = format!("DELETE FROM images WHERE id IN ({})", placeholders);
-    let mut q = sqlx::query(&query);
-    for id in &ids {
-        q = q.bind(id);
-    }
-
-    q.execute(&state.0).await.map_err(|e| e.to_string())?;
-
-    Ok(())
+    // Single delete path; library files are kept (delete_files = false).
+    crate::crud::lifecycle::delete_items_impl(
+        &state.0,
+        crate::crud::lifecycle::ItemKind::Image,
+        &ids,
+        false,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -566,6 +570,9 @@ pub async fn get_image_by_id(
     })
 }
 
+/// Backfill/repair the thumbnail cache for every image (self-healing).
+/// Backfill/repair the thumbnail cache. Pass `ids` to limit it to just-imported
+/// rows. Generation runs with bounded concurrency so it never pins the CPU.
 #[tauri::command]
 pub async fn get_image_metadata(filepath: String) -> Result<ImageMetadata, String> {
     let path = PathBuf::from(&filepath);

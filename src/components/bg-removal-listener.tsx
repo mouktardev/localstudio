@@ -7,6 +7,8 @@ interface BgRemovalProgress {
   id: number
   progress: number
   message: string
+  stage?: string
+  status?: string
 }
 
 export function BgRemovalListener() {
@@ -25,11 +27,12 @@ export function BgRemovalListener() {
 
   useEffect(() => {
     const unlistenProgress = listen<BgRemovalProgress>('bg-removal-progress', (event) => {
-      const { id, progress, message } = event.payload
-      if (progress === 100 || progress === 0) {
-        delBgRemoval({ id, progress: 0, message: '' })
+      const payload = event.payload
+      const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+      if (status === 'done' || status === 'failed' || status === 'cancelled') {
+        delBgRemoval({ ...payload, status })
       } else {
-        setBgRemoval({ id, progress, message })
+        setBgRemoval(payload)
       }
     })
 

@@ -7,6 +7,12 @@ interface VideoCompressionProgress {
   id: number
   progress: number
   message: string
+  stage?: string
+  status?: string
+  fps?: number | null
+  speed?: number | null
+  out_time?: number | null
+  eta_seconds?: number | null
 }
 
 export function VideoCompressionListener() {
@@ -15,7 +21,14 @@ export function VideoCompressionListener() {
   const setCompression = useSetRowCallback(
     'video_compressions',
     (param: VideoCompressionProgress) => param.id.toString(),
-    (param: VideoCompressionProgress) => ({ progress: param.progress, message: param.message }),
+    (param: VideoCompressionProgress) => ({
+      progress: param.progress,
+      message: param.message,
+      stage: param.stage ?? '',
+      status: param.status ?? 'running',
+      eta_seconds: param.eta_seconds ?? 0,
+      speed: param.speed ?? 0,
+    }),
     []
   )
 
@@ -28,11 +41,13 @@ export function VideoCompressionListener() {
     const unlistenProgress = listen<VideoCompressionProgress>(
       'video-compression-progress',
       (event) => {
-        const { id, progress, message } = event.payload
-        if (progress === 100 || progress === 0) {
-          delCompression({ id, progress: 0, message: '' })
+        const payload = event.payload
+        // Explicit status replaces the old `0 || 100` conflation.
+        const status = payload.status ?? (payload.progress >= 100 ? 'done' : 'running')
+        if (status === 'done' || status === 'failed' || status === 'cancelled') {
+          delCompression({ ...payload, status })
         } else {
-          setCompression({ id, progress, message })
+          setCompression(payload)
         }
       }
     )

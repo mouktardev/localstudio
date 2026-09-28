@@ -6,15 +6,21 @@ import {
   selectVideoFiles,
   importVideos,
   deleteVideosByIds,
+  deleteItems,
+  deleteOutputs,
   downloadFfmpeg,
   getFilters,
   updateFilters,
   resetFilters,
   getCompressionPresets,
-  compressVideosByIds,
+  getEncoderCapabilities,
+  compressVideosByIdsV2,
   generateVideoThumbnails,
-  convertVideosByIds,
+  convertVideosByIdsV2,
   type CompressionPreset,
+  type CompressionRequest,
+  type DeleteAction,
+  type EncoderCapabilities,
   type VideoFormat,
 } from '@/lib/tauri'
 import type { Video, VideoQueryParams } from '@/lib/tauri'
@@ -99,12 +105,23 @@ function VideosPage() {
   const [compressDialogOpen, setCompressDialogOpen] = useState(false)
   const [convertDialogOpen, setConvertDialogOpen] = useState(false)
   const [compressionPresets, setCompressionPresets] = useState<CompressionPreset[]>([])
+  const [encoderCapabilities, setEncoderCapabilities] = useState<EncoderCapabilities>({
+    h264: true,
+    hevc: false,
+    av1: false,
+    hardware: [],
+  })
 
   useEffect(() => {
     getCompressionPresets()
       .then(setCompressionPresets)
       .catch((err) => {
         logError(`Failed to load compression presets: ${err}`)
+      })
+    getEncoderCapabilities()
+      .then(setEncoderCapabilities)
+      .catch((err) => {
+        logError(`Failed to detect encoder capabilities: ${err}`)
       })
   }, [])
 
@@ -277,43 +294,76 @@ function VideosPage() {
     async (id: number) => {
       try {
         await deleteVideosByIds([id])
+        // Only touch the persisted selection when this id was actually selected.
+        if (selectedIds.includes(id)) {
+          await removeVideoSelection(id)
+        }
         setSelectedIds((prev) => prev.filter((i) => i !== id))
-        await removeVideoSelection(id)
         await reloadVideos()
         await addNotification({ message: 'Removed 1 video', status: 'success' })
       } catch (err) {
         logError(`Failed to delete video: ${err}`)
       }
     },
-    [reloadVideos]
+    [reloadVideos, selectedIds]
   )
 
-  const handleDeleteSelected = useCallback(async () => {
-    if (selectedIds.length === 0) return
-    const count = selectedIds.length
-    try {
-      await deleteVideosByIds(selectedIds)
-      setSelectedIds([])
-      await clearVideoSelections()
-      await reloadVideos()
-      await addNotification({
-        message: `Removed ${count} video${count > 1 ? 's' : ''}`,
-        status: 'success',
-      })
-    } catch (err) {
-      logError(`Failed to delete videos: ${err}`)
-    }
-  }, [selectedIds, reloadVideos])
+  const handleDeleteSelected = useCallback(
+    async (action: DeleteAction) => {
+      if (selectedIds.length === 0) return
+      const count = selectedIds.length
+      try {
+        const report =
+          action === 'outputs'
+            ? await deleteOutputs('video', selectedIds)
+            : await deleteItems('video', selectedIds, action === 'all')
+
+        setSelectedIds([])
+        await clearVideoSelections()
+        await reloadVideos()
+
+        const parts = [
+          action === 'outputs'
+            ? `Deleted generated outputs for ${count} video${count > 1 ? 's' : ''}`
+            : `Removed ${count} video${count > 1 ? 's' : ''}`,
+        ]
+        if (report.files_deleted > 0) parts.push(`${report.files_deleted} file(s) deleted`)
+        if (report.skipped.length > 0) parts.push(`${report.skipped.length} file(s) kept`)
+        await addNotification({ message: parts.join(' · '), status: 'success' })
+      } catch (err) {
+        logError(`Failed to delete videos: ${err}`)
+      }
+    },
+    [selectedIds, reloadVideos]
+  )
 
   const handleCompress = useCallback(
-    async (ids: number[], quality: number, preset: string) => {
+    async (ids: number[], request: CompressionRequest) => {
       try {
-        const result = await compressVideosByIds(ids, quality, preset)
-        if (result > 0) {
+        const result = await compressVideosByIdsV2(ids, request)
+        const kept = result.results.filter((r) => r.kept_original).length
+
+        if (result.failed > 0) {
+          const firstError = result.results.find((r) => r.status === 'failed')?.message
           await addNotification({
-            message: `Compressed ${result} video${result > 1 ? 's' : ''}`,
+            message: `Compressed ${result.processed}, failed ${result.failed}${firstError ? ` — ${firstError}` : ''}`,
+            status: 'error',
+          })
+        } else if (result.processed > 0) {
+          await addNotification({
+            message: `Compressed ${result.processed} video${result.processed > 1 ? 's' : ''}${kept > 0 ? ` (${kept} already optimal)` : ''}`,
             status: 'success',
           })
+        } else if (result.cancelled > 0) {
+          await addNotification({
+            message: `Cancelled ${result.cancelled} compression${result.cancelled > 1 ? 's' : ''}`,
+            status: 'info',
+          })
+        } else {
+          await addNotification({ message: 'Nothing to compress', status: 'info' })
+        }
+
+        if (result.processed > 0) {
           await reloadVideos()
         }
       } catch (err) {
@@ -326,13 +376,29 @@ function VideosPage() {
   const handleConvertSelected = useCallback(
     async (ids: number[], format: string) => {
       try {
-        const count = ids.length
-        await convertVideosByIds(ids, format as VideoFormat)
+        const result = await convertVideosByIdsV2(ids, format as VideoFormat)
+
+        if (result.failed > 0) {
+          const firstError = result.errors[0]?.message
+          await addNotification({
+            message: `Converted ${result.processed}, failed ${result.failed}${firstError ? ` — ${firstError}` : ''}`,
+            status: 'error',
+          })
+        } else if (result.processed > 0) {
+          await addNotification({
+            message: `Converted ${result.processed} video${result.processed === 1 ? '' : 's'} to ${format.toUpperCase()}`,
+            status: 'success',
+          })
+        } else if (result.cancelled > 0) {
+          await addNotification({
+            message: `Cancelled ${result.cancelled} conversion${result.cancelled > 1 ? 's' : ''}`,
+            status: 'info',
+          })
+        } else {
+          await addNotification({ message: 'Nothing to convert', status: 'info' })
+        }
+
         await reloadVideos()
-        await addNotification({
-          message: `Converted ${count} video${count > 1 ? 's' : ''} to ${format.toUpperCase()}`,
-          status: 'success',
-        })
       } catch (err) {
         logError(`Failed to convert videos: ${err}`)
       }
@@ -499,6 +565,7 @@ function VideosPage() {
         onOpenChange={setCompressDialogOpen}
         onConfirm={handleCompress}
         presets={compressionPresets}
+        capabilities={encoderCapabilities}
       />
       <ConvertFormatDialog
         items={videos.map((v) => ({ id: v.id, filename: v.filename, size: v.size }))}
